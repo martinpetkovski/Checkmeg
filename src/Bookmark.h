@@ -8,6 +8,8 @@
 #include <map>
 #include <limits>
 #include <filesystem>
+#include <random>
+#include <functional>
 
 enum class BookmarkType {
     Text,
@@ -18,6 +20,9 @@ enum class BookmarkType {
 };
 
 struct Bookmark {
+    // Stable identifier for syncing across devices/backends.
+    // Generated locally for legacy bookmarks that don't have one yet.
+    std::string id;
     BookmarkType type;
     bool typeExplicit = false;
     std::string content;
@@ -37,14 +42,36 @@ public:
     std::vector<Bookmark> bookmarks;
     std::string filePath;
 
+    // When false, the manager does NOT read or write the local JSON file.
+    // Intended for "logged in" mode where Supabase is the source of truth.
+    bool useLocalFile = true;
+
+    // Optional hooks for syncing (e.g. to Supabase). These are no-ops unless set.
+    // `suppressSyncCallbacks` can be used during bulk loads/merges.
+    bool suppressSyncCallbacks = false;
+    std::function<void(const Bookmark&)> onUpsert;
+    std::function<void(const Bookmark&)> onDelete;
+
     bool hasLastWriteTime = false;
     std::filesystem::file_time_type lastWriteTime;
 
-    BookmarkManager(const std::string& path) : filePath(path) {
-        load(true);
+    BookmarkManager(const std::string& path, bool autoLoad = true) : filePath(path) {
+        if (autoLoad && useLocalFile) load(true);
+    }
+
+    void SetUseLocalFile(bool enable) {
+        useLocalFile = enable;
+    }
+
+    void ReplaceAll(const std::vector<Bookmark>& newBookmarks) {
+        bool old = suppressSyncCallbacks;
+        suppressSyncCallbacks = true;
+        bookmarks = newBookmarks;
+        suppressSyncCallbacks = old;
     }
 
     void loadIfChanged(bool skipBinary = false) {
+        if (!useLocalFile) return;
         std::error_code ec;
         auto wt = std::filesystem::last_write_time(filePath, ec);
         if (ec) {
@@ -60,6 +87,7 @@ public:
 
     void add(const std::string& content, const std::string& deviceId = "", bool validOnAnyDevice = true) {
         Bookmark b;
+        b.id = newUuid();
         b.content = content;
         b.timestamp = std::time(nullptr);
         b.lastUsed = b.timestamp;
@@ -70,10 +98,13 @@ public:
         b.validOnAnyDevice = validOnAnyDevice;
         bookmarks.push_back(b);
         save();
+
+        if (!suppressSyncCallbacks && onUpsert) onUpsert(bookmarks.back());
     }
 
     void addBinary(const std::string& content, const std::string& data, const std::string& mime, const std::string& deviceId = "", bool validOnAnyDevice = true) {
         Bookmark b;
+        b.id = newUuid();
         b.content = content;
         b.binaryData = data;
         b.mimeType = mime;
@@ -86,12 +117,17 @@ public:
         b.validOnAnyDevice = validOnAnyDevice;
         bookmarks.push_back(b);
         save();
+
+        if (!suppressSyncCallbacks && onUpsert) onUpsert(bookmarks.back());
     }
 
     void remove(size_t index) {
         if (index < bookmarks.size()) {
+            Bookmark removed = bookmarks[index];
             bookmarks.erase(bookmarks.begin() + index);
             save();
+
+            if (!suppressSyncCallbacks && onDelete && !removed.id.empty()) onDelete(removed);
         }
     }
 
@@ -103,6 +139,8 @@ public:
             }
             bookmarks[index].timestamp = std::time(nullptr);
             save();
+
+            if (!suppressSyncCallbacks && onUpsert) onUpsert(bookmarks[index]);
         }
     }
 
@@ -118,6 +156,8 @@ public:
             }
             bookmarks[index].timestamp = std::time(nullptr);
             save();
+
+            if (!suppressSyncCallbacks && onUpsert) onUpsert(bookmarks[index]);
         }
     }
 
@@ -136,6 +176,8 @@ public:
             bookmarks[index].deviceId = deviceId;
             bookmarks[index].validOnAnyDevice = validOnAnyDevice;
             save();
+
+            if (!suppressSyncCallbacks && onUpsert) onUpsert(bookmarks[index]);
         }
     }
 
@@ -144,6 +186,8 @@ public:
             bookmarks[index].binaryData = data;
             bookmarks[index].binaryDataLoaded = true;
             save();
+
+            if (!suppressSyncCallbacks && onUpsert) onUpsert(bookmarks[index]);
         }
     }
 void updateLastUsed(size_t index) {
@@ -153,6 +197,7 @@ void updateLastUsed(size_t index) {
         }
     }
     void ensureBinaryDataLoaded(size_t index) {
+        if (!useLocalFile) return;
         if (index < bookmarks.size() && bookmarks[index].type == BookmarkType::Binary && !bookmarks[index].binaryDataLoaded) {
             std::string data = loadBinaryDataForIndex(bookmarks[index].originalFileIndex);
             if (!data.empty()) {
@@ -172,6 +217,7 @@ void updateLastUsed(size_t index) {
     }
 
     void save() {
+        if (!useLocalFile) return;
         // Check if we need to load missing binary data
         bool needToLoad = false;
         for (const auto& b : bookmarks) {
@@ -191,6 +237,7 @@ void updateLastUsed(size_t index) {
         for (size_t i = 0; i < bookmarks.size(); ++i) {
             const auto& b = bookmarks[i];
             out << "  {\n";
+            out << "    \"id\": \"" << escape(b.id) << "\",\n";
             out << "    \"type\": \"" << typeToString(b.type) << "\",\n";
             out << "    \"typeExplicit\": " << (b.typeExplicit ? "true" : "false") << ",\n";
             if (b.type == BookmarkType::Binary) {
@@ -223,6 +270,7 @@ void updateLastUsed(size_t index) {
     }
 
     void load(bool skipBinary = false) {
+        if (!useLocalFile) return;
         // For the "start simple" phase, we will implement a very basic parser 
         // that assumes the exact format we write.
         // In a real app, use nlohmann/json.
@@ -242,6 +290,7 @@ void updateLastUsed(size_t index) {
             if (line.find("{") == 0) {
                 inside = true;
                 current = Bookmark();
+                current.id.clear();
                 current.tags.clear();
                 // Default values for new fields if missing in JSON
                 current.validOnAnyDevice = true; 
@@ -251,6 +300,7 @@ void updateLastUsed(size_t index) {
                 insideTags = false;
             } else if (line.find("}") == 0) {
                 if (inside) {
+                    if (current.id.empty()) current.id = newUuid();
                     bookmarks.push_back(current);
                     inside = false;
                     insideTags = false;
@@ -268,7 +318,9 @@ void updateLastUsed(size_t index) {
                     continue;
                 }
 
-                if (line.find("\"type\":") == 0) {
+                if (line.find("\"id\":") == 0) {
+                    current.id = unescape(extractValue(line));
+                } else if (line.find("\"type\":") == 0) {
                     std::string val = extractValue(line);
                     if (val == "url") current.type = BookmarkType::URL;
                     else if (val == "file") current.type = BookmarkType::File;
@@ -324,6 +376,45 @@ void updateLastUsed(size_t index) {
     }
 
 private:
+    std::string newUuid() {
+        // RFC 4122 version 4 UUID.
+        // Good enough for local stable IDs; no external deps.
+        static thread_local std::mt19937_64 rng([] {
+            std::random_device rd;
+            std::seed_seq seq{ rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd() };
+            return std::mt19937_64(seq);
+        }());
+
+        std::uniform_int_distribution<uint64_t> dist;
+        uint64_t a = dist(rng);
+        uint64_t b = dist(rng);
+
+        // Set version (4) and variant (10xx)
+        b = (b & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL; // variant
+        a = (a & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL; // version
+
+        auto hex = [](uint64_t v, int n) {
+            static const char* k = "0123456789abcdef";
+            std::string s;
+            s.reserve(n);
+            for (int i = (n - 1) * 4; i >= 0; i -= 4) s.push_back(k[(v >> i) & 0xF]);
+            return s;
+        };
+
+        std::string out;
+        out.reserve(36);
+        out += hex((a >> 32) & 0xFFFFFFFFULL, 8);
+        out += "-";
+        out += hex((a >> 16) & 0xFFFFULL, 4);
+        out += "-";
+        out += hex(a & 0xFFFFULL, 4);
+        out += "-";
+        out += hex((b >> 48) & 0xFFFFULL, 4);
+        out += "-";
+        out += hex(b & 0xFFFFFFFFFFFFULL, 12);
+        return out;
+    }
+
     std::string typeToString(BookmarkType t) {
         switch(t) {
             case BookmarkType::URL: return "url";

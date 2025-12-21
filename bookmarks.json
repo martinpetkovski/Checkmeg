@@ -1,8 +1,10 @@
 [
   {
+    "id": "fe31bee0-d371-4b0b-88fe-f815725ff8d2",
     "type": "binary",
     "typeExplicit": true,
     "mimeType": "application/octet-stream",
+    "binaryData": "",
     "lastUsed": 0,
     "tags": [
     ],
@@ -12,6 +14,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "666e431f-95c1-48bd-b5fc-3a2bfe582430",
     "type": "file",
     "typeExplicit": false,
     "lastUsed": 0,
@@ -25,6 +28,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "3854d9a7-59bb-41c5-bd6a-5ac2f82199bc",
     "type": "file",
     "typeExplicit": false,
     "lastUsed": 0,
@@ -37,6 +41,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "390c2a73-b985-403c-8b88-15db86cdcc7c",
     "type": "url",
     "typeExplicit": true,
     "lastUsed": 0,
@@ -49,9 +54,10 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "5c8d0caa-64b3-49de-95d7-110c10672252",
     "type": "file",
     "typeExplicit": false,
-    "lastUsed": 1766312691,
+    "lastUsed": 0,
     "tags": [
       "Projects"
     ],
@@ -61,6 +67,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "6bb13941-1b7d-4279-a2dc-78e2b4402254",
     "type": "url",
     "typeExplicit": false,
     "lastUsed": 0,
@@ -75,6 +82,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "e3fe642b-f157-4007-9022-01222c5e56cf",
     "type": "url",
     "typeExplicit": false,
     "lastUsed": 0,
@@ -89,6 +97,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "92be69d4-5b5a-4aec-8302-e558450122b5",
     "type": "url",
     "typeExplicit": false,
     "lastUsed": 0,
@@ -101,6 +110,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "d958509f-e077-4b97-944a-f10c27b39c09",
     "type": "command",
     "typeExplicit": true,
     "lastUsed": 0,
@@ -112,6 +122,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "39475c8a-521e-4ee2-9999-86602e818914",
     "type": "text",
     "typeExplicit": true,
     "lastUsed": 0,
@@ -123,6 +134,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "41ab0e42-c5cc-4c4f-baad-1f5ad3853ae8",
     "type": "text",
     "typeExplicit": false,
     "lastUsed": 0,
@@ -134,6 +146,7 @@
     "validOnAnyDevice": true
   },
   {
+    "id": "b2e5bb40-1627-4598-92d5-ceb2d58b1750",
     "type": "text",
     "typeExplicit": false,
     "lastUsed": 0,
@@ -142,6 +155,18 @@
     "content": "Checkmeg.exe",
     "timestamp": 1766253609,
     "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "id": "523f056a-3eab-4eac-8166-53d336b98da0",
+    "type": "text",
+    "typeExplicit": false,
+    "lastUsed": 0,
+    "tags": [
+    ],
+    "content": "neshtoneshto",
+    "timestamp": 1766331490,
+    "deviceId": "SERENITY",
     "validOnAnyDevice": true
   }
 ]

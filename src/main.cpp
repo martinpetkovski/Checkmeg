@@ -10,7 +10,11 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <unordered_set>
+#include <memory>
 #include "Bookmark.h"
+#include "SupabaseAuth.h"
+#include "SupabaseBookmarks.h"
 #include "resource.h"
 
 // Forward declaration (defined later in this file)
@@ -192,6 +196,15 @@ static int FindDuplicateIndex(const std::string& content, int excludeIndex = -1)
 static LRESULT CALLBACK EditDialogChildSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
     UINT_PTR /*uIdSubclass*/, DWORD_PTR /*dwRefData*/) {
     if (msg == WM_KEYDOWN) {
+        if (wParam == VK_TAB) {
+            HWND parent = GetParent(hWnd);
+            if (parent) {
+                bool backwards = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                HWND next = GetNextDlgTabItem(parent, hWnd, backwards ? TRUE : FALSE);
+                if (next) SetFocus(next);
+            }
+            return 0;
+        }
         if (wParam == VK_RETURN) {
             HWND parent = GetParent(hWnd);
             if (parent) PostMessageW(parent, WM_COMMAND, MAKEWPARAM(1, BN_CLICKED), 0);
@@ -204,7 +217,7 @@ static LRESULT CALLBACK EditDialogChildSubclassProc(HWND hWnd, UINT msg, WPARAM 
         }
     }
     if (msg == WM_CHAR) {
-        if (wParam == VK_RETURN || wParam == VK_ESCAPE) return 0;
+        if (wParam == VK_RETURN || wParam == VK_ESCAPE || wParam == VK_TAB) return 0;
     }
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 }
@@ -243,6 +256,18 @@ HFONT g_hEmojiFont = NULL;
 ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logoImage = nullptr;
 
+// Supabase auth (session persists to disk)
+SupabaseAuth g_supabaseAuth;
+SupabaseBookmarks g_supabaseBookmarks(&g_supabaseAuth);
+
+static HWND g_hOptionsWnd = NULL;
+
+static void ConfigureBookmarkSyncHooks();
+static void ReloadBookmarksFromActiveBackend(HWND hWndForUi, bool showErrors);
+static void RefreshSearchResultsAfterBookmarkReload();
+static std::string GetBookmarksJsonPathA();
+static void SyncLocalBookmarksToSupabase(HWND hWndForUi);
+
 // Constants
 #define HOTKEY_ID_OPEN 1
 #define HOTKEY_ID_CAPTURE 2
@@ -258,6 +283,12 @@ Gdiplus::Image* g_logoImage = nullptr;
 // Forward declarations
 LRESULT CALLBACK MainWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK SearchWndProc(HWND, UINT, WPARAM, LPARAM);
+
+static bool ShowEmailPasswordDialog(const wchar_t* title, std::string* outEmail, std::string* outPassword);
+static void RefreshOptionsLoginButtons(HWND hBtnLogin, HWND hBtnSignup, HWND hBtnLogout);
+static void TryAutoRestoreSupabaseSession();
+static bool IsBinarySyncEnabled();
+static void SetBinarySyncEnabled(bool enable);
 LRESULT CALLBACK ListBoxProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK EditProc(HWND, UINT, WPARAM, LPARAM);
 void CaptureAndBookmark();
@@ -267,7 +298,7 @@ void ToggleSearchWindow();
 void HideSearchWindowNoRestore();
 void DeleteSelectedBookmark();
 void EditSelectedBookmark();
-void EditBookmarkAtIndex(size_t index, const Bookmark* pDuplicateSource = nullptr);
+bool EditBookmarkAtIndex(size_t index, const Bookmark* pDuplicateSource = nullptr, std::string* outSavedContentUtf8 = nullptr);
 void DuplicateSelectedBookmark();
 void ExecuteSelectedBookmark();
 void WaitForTargetFocus();
@@ -300,13 +331,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     
     LoadLogoPngIfPresent();
+
+    // Attempt to restore auth session early so we can decide the bookmark backend.
+    TryAutoRestoreSupabaseSession();
     
     // Initialize Bookmark Manager
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
     std::string exePath(path);
     std::string jsonPath = exePath.substr(0, exePath.find_last_of("\\/")) + "\\bookmarks.json";
-    g_bookmarkManager = new BookmarkManager(jsonPath);
+
+    // Do not autoload here; we decide local vs Supabase based on login state.
+    g_bookmarkManager = new BookmarkManager(jsonPath, false);
+    ConfigureBookmarkSyncHooks();
+    ReloadBookmarksFromActiveBackend(NULL, false);
 
     // Check for command line arguments (Context Menu Mode)
     int argc = 0;
@@ -344,26 +382,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     std::string base64 = base64_encode((unsigned char*)data.data(), data.size());
                     
                     std::string filename = contentToBookmark.substr(contentToBookmark.find_last_of("\\/") + 1);
-                    
-                    // Store filename in content, base64 in binaryData
-                    g_bookmarkManager->addBinary(filename, base64, "application/octet-stream", GetCurrentDeviceId(), true);
-                    if (!g_bookmarkManager->bookmarks.empty()) {
-                        size_t idx = g_bookmarkManager->bookmarks.size() - 1;
-                        // g_bookmarkManager->bookmarks[idx].tags.push_back("filename:" + filename); // No longer needed as tag if content is filename
-                        g_bookmarkManager->save();
-                        EditBookmarkAtIndex(idx);
-                    }
+
+                    // Show edit dialog first; only add on Save.
+                    Bookmark nb;
+                    nb.type = BookmarkType::Binary;
+                    nb.typeExplicit = true;
+                    nb.content = filename;
+                    nb.binaryData = base64;
+                    nb.mimeType = "application/octet-stream";
+                    nb.tags.clear();
+                    nb.timestamp = std::time(nullptr);
+                    nb.lastUsed = nb.timestamp;
+                    nb.deviceId = GetCurrentDeviceId();
+                    nb.validOnAnyDevice = true;
+                    (void)EditBookmarkAtIndex((size_t)-1, &nb);
                 } else {
                     MessageBoxW(NULL, L"Failed to open file for binary bookmarking.", L"Error", MB_OK);
                 }
             } else {
-                // Add bookmark and show edit dialog
-                g_bookmarkManager->add(contentToBookmark, GetCurrentDeviceId(), true);
-                
-                // Show edit dialog for the new bookmark
-                if (!g_bookmarkManager->bookmarks.empty()) {
-                    EditBookmarkAtIndex(g_bookmarkManager->bookmarks.size() - 1);
-                }
+                // Show edit dialog first; only add on Save.
+                Bookmark nb;
+                nb.type = BookmarkType::Text;
+                nb.typeExplicit = false;
+                nb.content = contentToBookmark;
+                nb.tags.clear();
+                nb.timestamp = std::time(nullptr);
+                nb.lastUsed = nb.timestamp;
+                nb.deviceId = GetCurrentDeviceId();
+                nb.validOnAnyDevice = true;
+                (void)EditBookmarkAtIndex((size_t)-1, &nb);
             }
         }
 
@@ -420,6 +467,322 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_gdiplusToken = 0;
     }
     return (int) msg.wParam;
+}
+
+static void ConfigureBookmarkSyncHooks() {
+    if (!g_bookmarkManager) return;
+
+    g_bookmarkManager->onUpsert = [](const Bookmark& b) {
+        if (!g_supabaseAuth.IsLoggedIn()) return;
+        if (b.type == BookmarkType::Binary && !IsBinarySyncEnabled()) return;
+        std::string err;
+        (void)g_supabaseBookmarks.Upsert(b, &err);
+    };
+
+    g_bookmarkManager->onDelete = [](const Bookmark& b) {
+        if (!g_supabaseAuth.IsLoggedIn()) return;
+        if (b.type == BookmarkType::Binary && !IsBinarySyncEnabled()) return;
+        std::string err;
+        (void)g_supabaseBookmarks.DeleteById(b.id, &err);
+    };
+}
+
+static void PumpUiMessages() {
+    MSG msg;
+    while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+class ModalProgress {
+public:
+    ModalProgress(HWND owner, const wchar_t* title, const wchar_t* message, int maxValue /* 0 => marquee */)
+        : m_owner(owner), m_max(maxValue) {
+        EnsureClassRegistered();
+
+        if (m_owner && IsWindow(m_owner)) {
+            EnableWindow(m_owner, FALSE);
+        }
+
+        const DWORD style = WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        const DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
+
+        int w = 360;
+        int h = 130;
+
+        RECT r{ 0, 0, w, h };
+        AdjustWindowRectEx(&r, style, FALSE, exStyle);
+        w = r.right - r.left;
+        h = r.bottom - r.top;
+
+        int x = GetSystemMetrics(SM_CXSCREEN) / 2 - w / 2;
+        int y = GetSystemMetrics(SM_CYSCREEN) / 2 - h / 2;
+
+        m_hWnd = CreateWindowExW(
+            exStyle,
+            L"CheckmegProgress",
+            title ? title : L"Working...",
+            style,
+            x, y, w, h,
+            m_owner,
+            NULL,
+            g_hInst,
+            this);
+
+        if (!m_hWnd) {
+            if (m_owner && IsWindow(m_owner)) EnableWindow(m_owner, TRUE);
+            return;
+        }
+
+        ShowWindow(m_hWnd, SW_SHOW);
+        UpdateWindow(m_hWnd);
+        SetText(message);
+        SetMax(maxValue);
+        PumpUiMessages();
+    }
+
+    ~ModalProgress() {
+        if (m_hWnd && IsWindow(m_hWnd)) {
+            DestroyWindow(m_hWnd);
+            m_hWnd = NULL;
+        }
+        if (m_owner && IsWindow(m_owner)) {
+            EnableWindow(m_owner, TRUE);
+            SetForegroundWindow(m_owner);
+        }
+        PumpUiMessages();
+    }
+
+    ModalProgress(const ModalProgress&) = delete;
+    ModalProgress& operator=(const ModalProgress&) = delete;
+
+    void SetText(const wchar_t* message) {
+        if (!m_hText || !IsWindow(m_hText)) return;
+        SetWindowTextW(m_hText, message ? message : L"");
+        PumpUiMessages();
+    }
+
+    void SetMax(int maxValue /* 0 => marquee */) {
+        m_max = maxValue;
+        if (!m_hProg || !IsWindow(m_hProg)) return;
+
+        if (m_max <= 0) {
+            // Marquee / indeterminate
+            LONG_PTR style = GetWindowLongPtrW(m_hProg, GWL_STYLE);
+            style |= PBS_MARQUEE;
+            SetWindowLongPtrW(m_hProg, GWL_STYLE, style);
+            SendMessageW(m_hProg, PBM_SETMARQUEE, TRUE, 30);
+        } else {
+            // Determinate
+            LONG_PTR style = GetWindowLongPtrW(m_hProg, GWL_STYLE);
+            style &= ~PBS_MARQUEE;
+            SetWindowLongPtrW(m_hProg, GWL_STYLE, style);
+            SendMessageW(m_hProg, PBM_SETRANGE32, 0, (LPARAM)m_max);
+            SendMessageW(m_hProg, PBM_SETPOS, 0, 0);
+        }
+
+        PumpUiMessages();
+    }
+
+    void SetPos(int pos) {
+        if (!m_hProg || !IsWindow(m_hProg)) return;
+        if (m_max <= 0) return;
+        SendMessageW(m_hProg, PBM_SETPOS, (WPARAM)pos, 0);
+        PumpUiMessages();
+    }
+
+private:
+    static void EnsureClassRegistered() {
+        static bool s_registered = false;
+        if (s_registered) return;
+
+        WNDCLASSEXW wc = { 0 };
+        wc.cbSize = sizeof(wc);
+        wc.hInstance = g_hInst;
+        wc.lpszClassName = L"CheckmegProgress";
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.hIcon = GetAppIcon();
+        wc.lpfnWndProc = [](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            ModalProgress* self = (ModalProgress*)GetWindowLongPtrW(hWnd, GWLP_USERDATA);
+            if (msg == WM_NCCREATE) {
+                CREATESTRUCTW* cs = (CREATESTRUCTW*)lParam;
+                SetWindowLongPtrW(hWnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+                return TRUE;
+            }
+            switch (msg) {
+                case WM_CREATE: {
+                    self = (ModalProgress*)GetWindowLongPtrW(hWnd, GWLP_USERDATA);
+                    if (!self) return 0;
+
+                    HDC hdc = GetDC(hWnd);
+                    int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
+                    ReleaseDC(hWnd, hdc);
+                    float scale = dpiY / 96.0f;
+
+                    self->m_hText = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                        (int)(16 * scale), (int)(14 * scale), (int)(320 * scale), (int)(20 * scale),
+                        hWnd, NULL, g_hInst, NULL);
+                    SendMessageW(self->m_hText, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+
+                    self->m_hProg = CreateWindowExW(0, PROGRESS_CLASSW, L"", WS_CHILD | WS_VISIBLE,
+                        (int)(16 * scale), (int)(44 * scale), (int)(320 * scale), (int)(18 * scale),
+                        hWnd, NULL, g_hInst, NULL);
+                    SendMessageW(self->m_hProg, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                    return 0;
+                }
+                case WM_CLOSE:
+                    // Prevent user from cancelling mid-sync.
+                    return 0;
+            }
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
+        };
+
+        RegisterClassExW(&wc);
+        s_registered = true;
+    }
+
+    HWND m_owner = NULL;
+    HWND m_hWnd = NULL;
+    HWND m_hText = NULL;
+    HWND m_hProg = NULL;
+    int m_max = 0;
+};
+
+static void ReloadBookmarksFromActiveBackend(HWND hWndForUi, bool showErrors) {
+    if (!g_bookmarkManager) return;
+
+    if (g_supabaseAuth.IsLoggedIn()) {
+        std::unique_ptr<ModalProgress> progress;
+        if (hWndForUi && IsWindow(hWndForUi)) {
+            progress = std::make_unique<ModalProgress>(hWndForUi, L"Supabase", L"Fetching bookmarks...", 0);
+        }
+        // Remote-only mode: ignore local file completely.
+        g_bookmarkManager->SetUseLocalFile(false);
+
+        std::vector<Bookmark> remote;
+        std::string err;
+        if (!g_supabaseBookmarks.FetchAll(&remote, &err, IsBinarySyncEnabled())) {
+            g_bookmarkManager->ReplaceAll({});
+            if (showErrors && hWndForUi) {
+                progress.reset();
+                MessageBoxW(hWndForUi, Utf8ToWide(err).c_str(), L"Supabase sync failed", MB_OK | MB_ICONERROR);
+            }
+        } else {
+            g_bookmarkManager->ReplaceAll(remote);
+        }
+    } else {
+        // Local mode.
+        g_bookmarkManager->SetUseLocalFile(true);
+        g_bookmarkManager->load(true);
+    }
+}
+
+static void RefreshSearchResultsAfterBookmarkReload() {
+    if (!g_hSearchWnd || !g_hEdit) return;
+    if (!IsWindow(g_hSearchWnd)) return;
+
+    wchar_t buffer[256] = {};
+    GetWindowTextW(g_hEdit, buffer, _countof(buffer));
+    UpdateSearchList(WideToUtf8(buffer));
+}
+
+static std::string GetBookmarksJsonPathA() {
+    char path[MAX_PATH];
+    GetModuleFileNameA(NULL, path, MAX_PATH);
+    std::string exePath(path);
+    return exePath.substr(0, exePath.find_last_of("\\/")) + "\\bookmarks.json";
+}
+
+static void SyncLocalBookmarksToSupabase(HWND hWndForUi) {
+    if (!g_supabaseAuth.IsLoggedIn()) {
+        MessageBoxW(hWndForUi, L"Please log in first.", L"Supabase", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    std::unique_ptr<ModalProgress> progress;
+    if (hWndForUi && IsWindow(hWndForUi)) {
+        progress = std::make_unique<ModalProgress>(hWndForUi, L"Supabase", L"Preparing sync...", 0);
+    }
+
+    // Load local bookmarks from disk (even if the app is in remote-only mode).
+    std::string jsonPath = GetBookmarksJsonPathA();
+    BookmarkManager local(jsonPath, true);
+    local.SetUseLocalFile(true);
+    // Ensure IDs exist for older files.
+    // load() already generates missing ids.
+
+    const bool allowBinary = IsBinarySyncEnabled();
+
+    // Fetch remote bookmarks.
+    std::vector<Bookmark> remote;
+    std::string err;
+    if (!g_supabaseBookmarks.FetchAll(&remote, &err, allowBinary)) {
+        progress.reset();
+        MessageBoxW(hWndForUi, Utf8ToWide(err).c_str(), L"Supabase sync failed", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    auto KeyFor = [&](const Bookmark& b) -> std::string {
+        // Local-priority conflict resolution: treat same normalized content as duplicates.
+        return NormalizeContentForDedup(b.content);
+    };
+
+    // De-dupe local by content key (keep first).
+    std::unordered_set<std::string> localKeys;
+    std::unordered_set<std::string> localIds;
+    std::vector<Bookmark> uniqueLocal;
+    uniqueLocal.reserve(local.bookmarks.size());
+    for (const auto& b : local.bookmarks) {
+        if (!allowBinary && b.type == BookmarkType::Binary) continue;
+        if (b.id.empty()) continue;
+        std::string k = KeyFor(b);
+        if (k.empty()) continue;
+        if (localKeys.insert(k).second) {
+            uniqueLocal.push_back(b);
+            localIds.insert(b.id);
+        }
+    }
+
+    // 1) Upsert local rows (local wins for same id).
+    int upserted = 0;
+    int done = 0;
+    const int totalOps = (int)uniqueLocal.size() + (int)remote.size();
+    if (progress) {
+        progress->SetText(L"Syncing to Supabase...");
+        progress->SetMax(totalOps);
+    }
+    for (const auto& b : uniqueLocal) {
+        std::string upErr;
+        if (g_supabaseBookmarks.Upsert(b, &upErr)) {
+            upserted++;
+        }
+        if (progress) progress->SetPos(++done);
+    }
+
+    // 2) Remove remote duplicates that conflict with local by content.
+    int deleted = 0;
+    for (const auto& rb : remote) {
+        if (rb.id.empty()) continue;
+        if (localIds.count(rb.id)) continue; // local already controls this row
+        std::string k = KeyFor(rb);
+        if (k.empty()) continue;
+        if (localKeys.count(k)) {
+            std::string delErr;
+            if (g_supabaseBookmarks.DeleteById(rb.id, &delErr)) {
+                deleted++;
+            }
+        }
+        if (progress) progress->SetPos(++done);
+    }
+
+    // Reload remote view and refresh UI.
+    ReloadBookmarksFromActiveBackend(hWndForUi, true);
+    RefreshSearchResultsAfterBookmarkReload();
+
+    progress.reset();
+    std::wstring msg = L"Sync complete. Upserted: " + std::to_wstring(upserted) + L". Removed remote duplicates: " + std::to_wstring(deleted) + L".";
+    MessageBoxW(hWndForUi, msg.c_str(), L"Supabase Sync", MB_OK | MB_ICONINFORMATION);
 }
 
 static std::wstring GetExeDirW() {
@@ -522,6 +885,25 @@ LRESULT CALLBACK LogoWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
                     int dy = (ch - dh) / 2;
                     g.DrawImage(g_logoImage, dx, dy, dw, dh);
                 }
+
+                // Login indicator (bottom-right): green if logged in, gray otherwise.
+                {
+                    int cw = rc.right - rc.left;
+                    int ch = rc.bottom - rc.top;
+                    int r = std::max(3, std::min(cw, ch) / 6);
+                    int pad = std::max(2, r / 3);
+                    int cx = cw - pad - r;
+                    int cy = ch - pad - r;
+
+                    bool loggedIn = g_supabaseAuth.IsLoggedIn();
+                    Gdiplus::Color fill = loggedIn
+                        ? Gdiplus::Color(255, 0, 200, 0)
+                        : Gdiplus::Color(255, 160, 160, 160);
+
+                    Gdiplus::SolidBrush brush(fill);
+                    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+                    g.FillEllipse(&brush, cx - r, cy - r, r * 2, r * 2);
+                }
             }
 
             EndPaint(hWnd, &ps);
@@ -529,6 +911,155 @@ LRESULT CALLBACK LogoWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
         }
     }
     return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+static void TryAutoRestoreSupabaseSession() {
+    std::string err;
+    (void)g_supabaseAuth.TryRestoreOrRefresh(&err);
+}
+
+static void RefreshOptionsLoginButtons(HWND hBtnLogin, HWND hBtnSignup, HWND hBtnLogout) {
+    if (!hBtnLogin || !hBtnSignup || !hBtnLogout) return;
+    if (g_supabaseAuth.IsLoggedIn()) {
+        ShowWindow(hBtnLogin, SW_HIDE);
+        ShowWindow(hBtnSignup, SW_HIDE);
+        std::wstring emailW = Utf8ToWide(g_supabaseAuth.Session().email);
+        if (emailW.empty()) emailW = L"(signed in)";
+        std::wstring text = L"Log out (" + emailW + L")";
+        SetWindowTextW(hBtnLogout, text.c_str());
+        ShowWindow(hBtnLogout, SW_SHOW);
+    } else {
+        ShowWindow(hBtnLogout, SW_HIDE);
+        ShowWindow(hBtnLogin, SW_SHOW);
+        ShowWindow(hBtnSignup, SW_SHOW);
+    }
+}
+
+static bool ShowEmailPasswordDialog(const wchar_t* title, std::string* outEmail, std::string* outPassword) {
+    if (!outEmail || !outPassword) return false;
+    *outEmail = "";
+    *outPassword = "";
+
+    static std::wstring s_email;
+    static std::wstring s_password;
+    static bool s_ok;
+    s_email.clear();
+    s_password.clear();
+    s_ok = false;
+
+    WNDCLASSEXW wc = {0};
+    wc.cbSize = sizeof(WNDCLASSEXW);
+    wc.lpfnWndProc = [](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        static HWND hEmail = NULL;
+        static HWND hPass = NULL;
+        static HWND hOk = NULL;
+        static HWND hCancel = NULL;
+        static HWND hLblEmail = NULL;
+        static HWND hLblPass = NULL;
+
+        switch (msg) {
+            case WM_CREATE: {
+                hLblEmail = CreateWindowExW(0, L"STATIC", L"Email:", WS_CHILD | WS_VISIBLE,
+                    12, 14, 360, 18, hWnd, NULL, g_hInst, NULL);
+                hEmail = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                    12, 34, 360, 24, hWnd, (HMENU)10, g_hInst, NULL);
+
+                hLblPass = CreateWindowExW(0, L"STATIC", L"Password:", WS_CHILD | WS_VISIBLE,
+                    12, 68, 360, 18, hWnd, NULL, g_hInst, NULL);
+                hPass = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+                    12, 88, 360, 24, hWnd, (HMENU)11, g_hInst, NULL);
+
+                hOk = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                    212, 128, 75, 28, hWnd, (HMENU)1, g_hInst, NULL);
+                hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                    297, 128, 75, 28, hWnd, (HMENU)2, g_hInst, NULL);
+
+                if (g_hUiFont) {
+                    SendMessageW(hLblEmail, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                    SendMessageW(hEmail, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                    SendMessageW(hLblPass, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                    SendMessageW(hPass, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                    SendMessageW(hOk, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                    SendMessageW(hCancel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                }
+
+                SetWindowSubclass(hEmail, EditDialogChildSubclassProc, 100, 0);
+                SetWindowSubclass(hPass, EditDialogChildSubclassProc, 101, 0);
+                SetFocus(hEmail);
+                return 0;
+            }
+            case WM_COMMAND: {
+                int id = LOWORD(wParam);
+                if (id == 1) {
+                    int elen = GetWindowTextLengthW(hEmail);
+                    std::vector<wchar_t> ebuf(elen + 1);
+                    GetWindowTextW(hEmail, ebuf.data(), elen + 1);
+                    s_email = ebuf.data();
+
+                    int plen = GetWindowTextLengthW(hPass);
+                    std::vector<wchar_t> pbuf(plen + 1);
+                    GetWindowTextW(hPass, pbuf.data(), plen + 1);
+                    s_password = pbuf.data();
+
+                    s_ok = true;
+                    DestroyWindow(hWnd);
+                    return 0;
+                }
+                if (id == 2) {
+                    DestroyWindow(hWnd);
+                    return 0;
+                }
+                return 0;
+            }
+            case WM_CLOSE:
+                DestroyWindow(hWnd);
+                return 0;
+        }
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
+    };
+    wc.hInstance = g_hInst;
+    wc.lpszClassName = L"CheckmegAuth";
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hIcon = GetAppIcon();
+    RegisterClassExW(&wc);
+
+    int w = 400;
+    int h = 200;
+    int x = GetSystemMetrics(SM_CXSCREEN) / 2 - w / 2;
+    int y = GetSystemMetrics(SM_CYSCREEN) / 2 - h / 2;
+
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST | WS_EX_CONTROLPARENT, L"CheckmegAuth", title,
+        WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, w, h,
+        g_hSearchWnd, NULL, g_hInst, NULL);
+
+    if (g_hSearchWnd && IsWindow(g_hSearchWnd)) EnableWindow(g_hSearchWnd, FALSE);
+
+    MSG msg;
+    BOOL bRet;
+    while ((bRet = GetMessage(&msg, NULL, 0, 0)) != 0) {
+        if (bRet == -1) break;
+        if (!IsWindow(hDlg)) break;
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE && (msg.hwnd == hDlg || IsChild(hDlg, msg.hwnd))) {
+            DestroyWindow(hDlg);
+            continue;
+        }
+        if (IsDialogMessageW(hDlg, &msg)) continue;
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    if (g_hSearchWnd && IsWindow(g_hSearchWnd)) EnableWindow(g_hSearchWnd, TRUE);
+
+    UnregisterClassW(L"CheckmegAuth", g_hInst);
+
+    if (!s_ok) return false;
+    std::string email = WideToUtf8(s_email);
+    std::string pass = WideToUtf8(s_password);
+    if (email.empty() || pass.empty()) return false;
+    *outEmail = email;
+    *outPassword = pass;
+    return true;
 }
 
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -805,12 +1336,16 @@ void CaptureAndBookmark() {
                         return;
                     }
 
-                    g_bookmarkManager->add(text, GetCurrentDeviceId(), true);
-
-                    // Immediately show edit dialog for the newly added bookmark
-                    if (!g_bookmarkManager->bookmarks.empty()) {
-                        EditBookmarkAtIndex(g_bookmarkManager->bookmarks.size() - 1);
-                    }
+                    Bookmark nb;
+                    nb.type = BookmarkType::Text;
+                    nb.typeExplicit = false;
+                    nb.content = text;
+                    nb.tags.clear();
+                    nb.timestamp = std::time(nullptr);
+                    nb.lastUsed = nb.timestamp;
+                    nb.deviceId = GetCurrentDeviceId();
+                    nb.validOnAnyDevice = true;
+                    (void)EditBookmarkAtIndex((size_t)-1, &nb);
                 }
             }
         }
@@ -850,10 +1385,18 @@ void CaptureAndBookmark() {
                             
                             // Use a generic name for clipboard images
                             std::string name = "Clipboard Image.png";
-                            g_bookmarkManager->addBinary(name, base64, "image/png", GetCurrentDeviceId(), true);
-                            if (!g_bookmarkManager->bookmarks.empty()) {
-                                EditBookmarkAtIndex(g_bookmarkManager->bookmarks.size() - 1);
-                            }
+                            Bookmark nb;
+                            nb.type = BookmarkType::Binary;
+                            nb.typeExplicit = true;
+                            nb.content = name;
+                            nb.binaryData = base64;
+                            nb.mimeType = "image/png";
+                            nb.tags.clear();
+                            nb.timestamp = std::time(nullptr);
+                            nb.lastUsed = nb.timestamp;
+                            nb.deviceId = GetCurrentDeviceId();
+                            nb.validOnAnyDevice = true;
+                            (void)EditBookmarkAtIndex((size_t)-1, &nb);
                         }
                         pStream->Release();
                     }
@@ -877,14 +1420,19 @@ void CaptureAndBookmark() {
                     
                     std::wstring wpath(path);
                     std::string filename = WideToUtf8(wpath.substr(wpath.find_last_of(L"\\/") + 1));
-                    
-                    g_bookmarkManager->addBinary(filename, base64, "application/octet-stream", GetCurrentDeviceId(), true);
-                    if (!g_bookmarkManager->bookmarks.empty()) {
-                        size_t idx = g_bookmarkManager->bookmarks.size() - 1;
-                        // g_bookmarkManager->bookmarks[idx].tags.push_back("filename:" + filename); // No longer needed
-                        g_bookmarkManager->save();
-                        EditBookmarkAtIndex(idx);
-                    }
+
+                    Bookmark nb;
+                    nb.type = BookmarkType::Binary;
+                    nb.typeExplicit = true;
+                    nb.content = filename;
+                    nb.binaryData = base64;
+                    nb.mimeType = "application/octet-stream";
+                    nb.tags.clear();
+                    nb.timestamp = std::time(nullptr);
+                    nb.lastUsed = nb.timestamp;
+                    nb.deviceId = GetCurrentDeviceId();
+                    nb.validOnAnyDevice = true;
+                    (void)EditBookmarkAtIndex((size_t)-1, &nb);
                 }
             }
         }
@@ -952,13 +1500,23 @@ LRESULT CALLBACK SearchWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
                         if (res == IDYES) EditBookmarkAtIndex((size_t)dup);
                         break;
                     }
-                    g_bookmarkManager->add(text, GetCurrentDeviceId(), true);
-                    // Immediately show edit dialog for the newly added bookmark
-                    if (!g_bookmarkManager->bookmarks.empty()) {
-                        EditBookmarkAtIndex(g_bookmarkManager->bookmarks.size() - 1);
+                    Bookmark nb;
+                    nb.type = BookmarkType::Text;
+                    nb.typeExplicit = false;
+                    nb.content = text;
+                    nb.tags.clear();
+                    nb.timestamp = std::time(nullptr);
+                    nb.lastUsed = nb.timestamp;
+                    nb.deviceId = GetCurrentDeviceId();
+                    nb.validOnAnyDevice = true;
+
+                    std::string saved;
+                    if (EditBookmarkAtIndex((size_t)-1, &nb, &saved)) {
+                        SetWindowTextW(g_hEdit, Utf8ToWide(saved).c_str());
+                        UpdateSearchList(saved);
+                    } else {
+                        // No-op on cancel
                     }
-                    // Refresh list after editing (or cancel)
-                    UpdateSearchList(text);
                 }
             } else if (LOWORD(wParam) == IDC_LOGO) {
                 ShowOptionsDialog();
@@ -1690,7 +2248,36 @@ static void SetRunAtStartup(bool enable) {
     }
 }
 
+static bool IsBinarySyncEnabled() {
+    DWORD value = 1;
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Checkmeg", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        DWORD type = REG_DWORD;
+        DWORD size = sizeof(value);
+        (void)RegQueryValueExW(hKey, L"SyncBinaryToSupabase", NULL, &type, (LPBYTE)&value, &size);
+        RegCloseKey(hKey);
+    }
+    return value != 0;
+}
+
+static void SetBinarySyncEnabled(bool enable) {
+    HKEY hKey = NULL;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Checkmeg", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        DWORD value = enable ? 1 : 0;
+        RegSetValueExW(hKey, L"SyncBinaryToSupabase", 0, REG_DWORD, (const BYTE*)&value, sizeof(value));
+        RegCloseKey(hKey);
+    }
+}
+
 void ShowOptionsDialog() {
+    // Singleton: if already open, focus it and return.
+    if (g_hOptionsWnd && IsWindow(g_hOptionsWnd)) {
+        ShowWindow(g_hOptionsWnd, SW_SHOW);
+        SetForegroundWindow(g_hOptionsWnd);
+        BringWindowToTop(g_hOptionsWnd);
+        return;
+    }
+
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.hInstance = g_hInst;
@@ -1704,7 +2291,13 @@ void ShowOptionsDialog() {
         static HWND hBtnCtx = NULL;
         static HWND hBtnRun = NULL;
         static HWND hBtnOpenJson = NULL;
+        static HWND hBtnSyncLocal = NULL;
+        static HWND hBtnRefreshSupabase = NULL;
+        static HWND hChkBinarySync = NULL;
         static HWND hBtnOk = NULL;
+        static HWND hBtnLogin = NULL;
+        static HWND hBtnSignup = NULL;
+        static HWND hBtnLogout = NULL;
         static bool isRegistered = false;
         static bool isRunAtStartup = false;
 
@@ -1726,25 +2319,55 @@ void ShowOptionsDialog() {
                 isRegistered = IsContextMenuRegistered();
                 isRunAtStartup = IsRunAtStartup();
 
-                // Run at Startup Checkbox
+                // Login section buttons (top section)
+                hBtnLogin = CreateWindowExW(0, L"BUTTON", L"Log in", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    (int)(40 * scale), (int)(130 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)10, g_hInst, NULL);
+                hBtnSignup = CreateWindowExW(0, L"BUTTON", L"Sign up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    (int)(40 * scale), (int)(165 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)11, g_hInst, NULL);
+                hBtnLogout = CreateWindowExW(0, L"BUTTON", L"Log out", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    (int)(40 * scale), (int)(147 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)12, g_hInst, NULL);
+
+                SendMessageW(hBtnLogin, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                SendMessageW(hBtnSignup, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                SendMessageW(hBtnLogout, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+
+                RefreshOptionsLoginButtons(hBtnLogin, hBtnSignup, hBtnLogout);
+
+                // Run at Startup Checkbox (System Integration section)
                 hBtnRun = CreateWindowExW(0, L"BUTTON", L"Run at Startup", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    (int)(40 * scale), (int)(130 * scale), (int)(300 * scale), (int)(25 * scale), hWnd, (HMENU)3, g_hInst, NULL);
+                    (int)(40 * scale), (int)(250 * scale), (int)(300 * scale), (int)(25 * scale), hWnd, (HMENU)3, g_hInst, NULL);
                 SendMessageW(hBtnRun, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                 SendMessageW(hBtnRun, BM_SETCHECK, isRunAtStartup ? BST_CHECKED : BST_UNCHECKED, 0);
 
                 // Context Menu Button
                 const wchar_t* btnText = isRegistered ? L"Remove from File Context Menu" : L"Add to File Context Menu";
                 hBtnCtx = CreateWindowExW(0, L"BUTTON", btnText, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(165 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)2, g_hInst, NULL);
+                    (int)(40 * scale), (int)(285 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)2, g_hInst, NULL);
                 SendMessageW(hBtnCtx, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
-                // Export Bookmarks File Button
+                // Export Bookmarks File Button (Data section)
+                hBtnRefreshSupabase = CreateWindowExW(0, L"BUTTON", L"Refresh from Supabase", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    (int)(40 * scale), (int)(370 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)7, g_hInst, NULL);
+                SendMessageW(hBtnRefreshSupabase, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+
                 hBtnOpenJson = CreateWindowExW(0, L"BUTTON", L"Export Bookmarks File", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(205 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)4, g_hInst, NULL);
+                    (int)(40 * scale), (int)(405 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)4, g_hInst, NULL);
                 SendMessageW(hBtnOpenJson, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
+                // Sync local -> Supabase (local priority)
+                hBtnSyncLocal = CreateWindowExW(0, L"BUTTON", L"Sync local data to Supabase", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    (int)(40 * scale), (int)(440 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)5, g_hInst, NULL);
+                SendMessageW(hBtnSyncLocal, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+
+                // Toggle Binary syncing
+                hChkBinarySync = CreateWindowExW(0, L"BUTTON", L"Sync binary bookmarks to Supabase",
+                    WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+                    (int)(40 * scale), (int)(475 * scale), (int)(320 * scale), (int)(25 * scale), hWnd, (HMENU)6, g_hInst, NULL);
+                SendMessageW(hChkBinarySync, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                SendMessageW(hChkBinarySync, BM_SETCHECK, IsBinarySyncEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+
                 hBtnOk = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                    (int)(280 * scale), (int)(250 * scale), (int)(80 * scale), (int)(30 * scale), hWnd, (HMENU)1, g_hInst, NULL);
+                    (int)(280 * scale), (int)(510 * scale), (int)(80 * scale), (int)(30 * scale), hWnd, (HMENU)1, g_hInst, NULL);
                 SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
                 SetFocus(hBtnOk);
@@ -1783,10 +2406,36 @@ void ShowOptionsDialog() {
                 SelectObject(hdc, oldPen);
                 DeleteObject(hPen);
 
-                // Section Header
+                // Login Header (top)
                 SelectObject(hdc, hSectionFont);
                 SetTextColor(hdc, RGB(0, 0, 0));
-                TextOutW(hdc, (int)(20 * scale), (int)(105 * scale), L"System Integration", 18);
+                TextOutW(hdc, (int)(20 * scale), (int)(105 * scale), L"Login", 5);
+
+                // Separator 2
+                hPen = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
+                oldPen = (HPEN)SelectObject(hdc, hPen);
+                MoveToEx(hdc, (int)(20 * scale), (int)(215 * scale), NULL);
+                LineTo(hdc, (int)(380 * scale), (int)(215 * scale));
+                SelectObject(hdc, oldPen);
+                DeleteObject(hPen);
+
+                // System Integration Header
+                SelectObject(hdc, hSectionFont);
+                SetTextColor(hdc, RGB(0, 0, 0));
+                TextOutW(hdc, (int)(20 * scale), (int)(225 * scale), L"System Integration", 18);
+
+                // Separator 3
+                hPen = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
+                oldPen = (HPEN)SelectObject(hdc, hPen);
+                MoveToEx(hdc, (int)(20 * scale), (int)(330 * scale), NULL);
+                LineTo(hdc, (int)(380 * scale), (int)(330 * scale));
+                SelectObject(hdc, oldPen);
+                DeleteObject(hPen);
+
+                // Data Header
+                SelectObject(hdc, hSectionFont);
+                SetTextColor(hdc, RGB(0, 0, 0));
+                TextOutW(hdc, (int)(20 * scale), (int)(345 * scale), L"Data", 4);
 
                 SelectObject(hdc, oldFont);
                 EndPaint(hWnd, &ps);
@@ -1796,6 +2445,54 @@ void ShowOptionsDialog() {
                 int id = LOWORD(wParam);
                 if (id == 1) { // OK
                     DestroyWindow(hWnd);
+                } else if (id == 10) { // Log in
+                    std::string email;
+                    std::string password;
+                    if (!ShowEmailPasswordDialog(L"Log in", &email, &password)) return 0;
+
+                    std::string err;
+                    bool ok = g_supabaseAuth.SignInWithPassword(email, password, &err);
+                    if (ok) {
+                        MessageBoxW(hWnd, L"Logged in.", L"Success", MB_OK | MB_ICONINFORMATION);
+                    } else {
+                        MessageBoxW(hWnd, Utf8ToWide(err).c_str(), L"Login failed", MB_OK | MB_ICONERROR);
+                    }
+
+                    if (ok && g_supabaseAuth.IsLoggedIn()) {
+                        ReloadBookmarksFromActiveBackend(hWnd, true);
+                        RefreshSearchResultsAfterBookmarkReload();
+                    }
+                    RefreshOptionsLoginButtons(hBtnLogin, hBtnSignup, hBtnLogout);
+                    if (g_hLogo) InvalidateRect(g_hLogo, NULL, TRUE);
+                } else if (id == 11) { // Sign up
+                    std::string email;
+                    std::string password;
+                    if (!ShowEmailPasswordDialog(L"Sign up", &email, &password)) return 0;
+
+                    std::string err;
+                    bool ok = g_supabaseAuth.SignUpWithPassword(email, password, &err);
+                    if (ok && g_supabaseAuth.IsLoggedIn()) {
+                        MessageBoxW(hWnd, L"Signed up and logged in.", L"Success", MB_OK | MB_ICONINFORMATION);
+                    } else if (ok) {
+                        // Signup succeeded but may require email confirmation.
+                        if (err.empty()) err = "Sign up succeeded. Please log in.";
+                        MessageBoxW(hWnd, Utf8ToWide(err).c_str(), L"Sign up", MB_OK | MB_ICONINFORMATION);
+                    } else {
+                        MessageBoxW(hWnd, Utf8ToWide(err).c_str(), L"Sign up failed", MB_OK | MB_ICONERROR);
+                    }
+
+                    if (ok && g_supabaseAuth.IsLoggedIn()) {
+                        ReloadBookmarksFromActiveBackend(hWnd, true);
+                        RefreshSearchResultsAfterBookmarkReload();
+                    }
+                    RefreshOptionsLoginButtons(hBtnLogin, hBtnSignup, hBtnLogout);
+                    if (g_hLogo) InvalidateRect(g_hLogo, NULL, TRUE);
+                } else if (id == 12) { // Log out
+                    g_supabaseAuth.Logout();
+                    ReloadBookmarksFromActiveBackend(hWnd, false);
+                    RefreshSearchResultsAfterBookmarkReload();
+                    RefreshOptionsLoginButtons(hBtnLogin, hBtnSignup, hBtnLogout);
+                    if (g_hLogo) InvalidateRect(g_hLogo, NULL, TRUE);
                 } else if (id == 2) { // Context Menu Toggle
                     if (isRegistered) {
                         RemoveContextMenuRegistry();
@@ -1837,6 +2534,24 @@ void ShowOptionsDialog() {
                             }
                         }
                     }
+                } else if (id == 5) { // Sync local -> Supabase
+                    SyncLocalBookmarksToSupabase(hWnd);
+                } else if (id == 7) { // Refresh from Supabase
+                    if (!g_supabaseAuth.IsLoggedIn()) {
+                        MessageBoxW(hWnd, L"Please log in first.", L"Supabase", MB_OK | MB_ICONINFORMATION);
+                        return 0;
+                    }
+                    ReloadBookmarksFromActiveBackend(hWnd, true);
+                    RefreshSearchResultsAfterBookmarkReload();
+                } else if (id == 6) { // Toggle binary syncing
+                    if (HIWORD(wParam) == BN_CLICKED && hChkBinarySync) {
+                        bool check = (SendMessageW(hChkBinarySync, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                        SetBinarySyncEnabled(check);
+                        if (g_supabaseAuth.IsLoggedIn()) {
+                            ReloadBookmarksFromActiveBackend(hWnd, false);
+                            RefreshSearchResultsAfterBookmarkReload();
+                        }
+                    }
                 }
                 return 0;
             }
@@ -1844,6 +2559,7 @@ void ShowOptionsDialog() {
                 if (hTitleFont) DeleteObject(hTitleFont);
                 if (hVersionFont) DeleteObject(hVersionFont);
                 if (hSectionFont) DeleteObject(hSectionFont);
+                g_hOptionsWnd = NULL;
                 return 0;
             case WM_CLOSE:
                 DestroyWindow(hWnd);
@@ -1858,16 +2574,25 @@ void ShowOptionsDialog() {
     int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
     ReleaseDC(NULL, hdc);
     float scale = dpiY / 96.0f;
-    
-    int w = (int)(400 * scale);
-    int h = (int)(330 * scale);
+
+    // Size window by desired CLIENT size to avoid clipped bottom buttons.
+    int clientW = (int)(400 * scale);
+    int clientH = (int)(580 * scale);
+    RECT r{ 0, 0, clientW, clientH };
+    DWORD style = WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
+    AdjustWindowRectEx(&r, style, FALSE, exStyle);
+    int w = r.right - r.left;
+    int h = r.bottom - r.top;
     int x = GetSystemMetrics(SM_CXSCREEN) / 2 - w / 2;
     int y = GetSystemMetrics(SM_CYSCREEN) / 2 - h / 2;
 
-    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"CheckmegOptions", L"Options",
-        WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU,
+    HWND hDlg = CreateWindowExW(exStyle, L"CheckmegOptions", L"Options",
+        style,
         x, y, w, h,
         g_hSearchWnd, NULL, g_hInst, NULL);
+
+    g_hOptionsWnd = hDlg;
 
     MSG msg;
     BOOL bRet;
@@ -2012,7 +2737,7 @@ void EditSelectedBookmark() {
     EditBookmarkAtIndex((size_t)originalIdx);
 }
 
-void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
+bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, std::string* outSavedContentUtf8) {
     Bookmark b;
     bool isNew = false;
     if (pDuplicateSource) {
@@ -2021,7 +2746,7 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
         b.deviceId = GetCurrentDeviceId();
         b.timestamp = std::time(nullptr);
     } else {
-        if (originalIdx >= g_bookmarkManager->bookmarks.size()) return;
+        if (originalIdx >= g_bookmarkManager->bookmarks.size()) return false;
         b = g_bookmarkManager->bookmarks[originalIdx];
     }
 
@@ -2048,7 +2773,7 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
     s_timeResult = timestampText;
     s_deviceIdResult = deviceIdText;
     s_validOnAnyDevice = b.validOnAnyDevice;
-    s_originalIdx = originalIdx;
+    s_originalIdx = isNew ? (size_t)-1 : originalIdx;
 
     // 0=Auto, 1=Text, 2=URL, 3=File, 4=Command, 5=Binary
     if (!b.typeExplicit) {
@@ -2079,8 +2804,8 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
             {
                 // Type dropdown
                 hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-                    WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-                    10, 10, 360, 250, hWnd, (HMENU)3, g_hInst, NULL);
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                    10, 10, 360, 250, hWnd, (HMENU)12, g_hInst, NULL);
 
                 // Emoji icons in dropdown
                 SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F9EA  Auto");  // 🧪
@@ -2092,12 +2817,12 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
                 SendMessageW(hCombo, CB_SETCURSEL, (WPARAM)s_typeSelection, 0);
 
                 hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ((LPCWSTR)((LPCREATESTRUCT)lParam)->lpCreateParams), 
-                    WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL, 10, 40, 360, 70, hWnd, NULL, g_hInst, NULL);
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL, 10, 40, 360, 70, hWnd, (HMENU)10, g_hInst, NULL);
 
                 hTagsLabel = CreateWindowExW(0, L"STATIC", L"Tags (comma-separated):", WS_CHILD | WS_VISIBLE,
                     10, 115, 360, 18, hWnd, NULL, g_hInst, NULL);
                 hTags = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", s_tagsResult.c_str(),
-                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 10, 135, 360, 22, hWnd, NULL, g_hInst, NULL);
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 10, 135, 360, 22, hWnd, (HMENU)11, g_hInst, NULL);
 
                 std::wstring deviceLine = L"Device ID: " + s_deviceIdResult;
                 hDeviceLabel = CreateWindowExW(0, L"STATIC", deviceLine.c_str(), WS_CHILD | WS_VISIBLE,
@@ -2108,14 +2833,14 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
                     10, 185, 360, 18, hWnd, NULL, g_hInst, NULL);
 
                 hValidCheck = CreateWindowExW(0, L"BUTTON", L"Valid on any device", 
-                    WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    10, 205, 360, 20, hWnd, (HMENU)4, g_hInst, NULL);
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    10, 205, 360, 20, hWnd, (HMENU)13, g_hInst, NULL);
                 if (s_validOnAnyDevice) {
                     SendMessageW(hValidCheck, BM_SETCHECK, BST_CHECKED, 0);
                 }
 
-                hSave = CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 200, 240, 80, 30, hWnd, (HMENU)1, g_hInst, NULL);
-                hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE, 290, 240, 80, 30, hWnd, (HMENU)2, g_hInst, NULL);
+                hSave = CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 200, 240, 80, 30, hWnd, (HMENU)1, g_hInst, NULL);
+                hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 290, 240, 80, 30, hWnd, (HMENU)2, g_hInst, NULL);
 
                 if (g_hUiFont) {
                     // Use emoji font for combo so emojis render, but keep Fira Code elsewhere.
@@ -2204,7 +2929,8 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
                         // Or check if filename is dup?
                         // For now, skip dup check for binary to avoid confusion
                         if (candidateTypeSel != 5) {
-                            int dup = FindDuplicateIndex(WideToUtf8(candidateW), (int)s_originalIdx);
+                            int exclude = (s_originalIdx == (size_t)-1) ? -1 : (int)s_originalIdx;
+                            int dup = FindDuplicateIndex(WideToUtf8(candidateW), exclude);
                             if (dup >= 0) {
                                 MessageBoxW(hWnd,
                                     L"Duplicate bookmark detected.\n\nDuplicates are not allowed.",
@@ -2239,10 +2965,28 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW+1);
     RegisterClassExW(&wc);
 
-    HWND hEditWnd = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST, L"CheckmegEdit", L"Edit Bookmark", 
-        WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU, 
-        GetSystemMetrics(SM_CXSCREEN)/2 - 220, GetSystemMetrics(SM_CYSCREEN)/2 - 175, 440, 350, 
-        g_hSearchWnd, NULL, g_hInst, (LPVOID)currentContent.c_str());
+    HWND hEditWnd = NULL;
+    {
+        // Size window by desired CLIENT size to avoid clipped bottom buttons.
+        int clientW = 440;
+        int clientH = 350;
+        RECT r{ 0, 0, clientW, clientH };
+        DWORD style = WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+        DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST | WS_EX_CONTROLPARENT;
+        AdjustWindowRectEx(&r, style, FALSE, exStyle);
+        int w = r.right - r.left;
+        int h = r.bottom - r.top;
+        int x = GetSystemMetrics(SM_CXSCREEN) / 2 - w / 2;
+        int y = GetSystemMetrics(SM_CYSCREEN) / 2 - h / 2;
+
+        hEditWnd = CreateWindowExW(exStyle, L"CheckmegEdit", L"Edit Bookmark",
+            style,
+            x, y, w, h,
+            g_hSearchWnd, NULL, g_hInst, (LPVOID)currentContent.c_str());
+    }
+
+    // True modal behavior: prevent the search window from handling Esc, etc.
+    if (g_hSearchWnd && IsWindow(g_hSearchWnd)) EnableWindow(g_hSearchWnd, FALSE);
 
     // Message loop for the modal window
     MSG msg;
@@ -2250,9 +2994,16 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
     while ((bRet = GetMessage(&msg, NULL, 0, 0)) != 0) {
         if (bRet == -1) break;
         if (!IsWindow(hEditWnd)) break;
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE && (msg.hwnd == hEditWnd || IsChild(hEditWnd, msg.hwnd))) {
+            DestroyWindow(hEditWnd);
+            continue;
+        }
+        if (IsDialogMessageW(hEditWnd, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
+
+    if (g_hSearchWnd && IsWindow(g_hSearchWnd)) EnableWindow(g_hSearchWnd, TRUE);
     
     UnregisterClassW(L"CheckmegEdit", g_hInst);
 
@@ -2267,19 +3018,43 @@ void EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource) {
         else { hasExplicitType = false; }
 
         std::vector<std::string> tags = ParseTags(WideToUtf8(s_tagsResult));
+        std::string newContent = WideToUtf8(s_editResult);
+        std::string newDeviceId = WideToUtf8(s_deviceIdResult);
+
         // Preserve original device ID when editing
         if (isNew) {
-            g_bookmarkManager->add(WideToUtf8(s_editResult), WideToUtf8(s_deviceIdResult), s_validOnAnyDevice);
-            size_t newIdx = g_bookmarkManager->bookmarks.size() - 1;
-            g_bookmarkManager->update(newIdx, WideToUtf8(s_editResult), hasExplicitType, explicitType, tags, WideToUtf8(s_deviceIdResult), s_validOnAnyDevice);
+            if (hasExplicitType && explicitType == BookmarkType::Binary) {
+                std::string mime = b.mimeType.empty() ? "application/octet-stream" : b.mimeType;
+
+                bool oldSuppress = g_bookmarkManager->suppressSyncCallbacks;
+                g_bookmarkManager->suppressSyncCallbacks = true;
+                g_bookmarkManager->addBinary(newContent, b.binaryData, mime, newDeviceId, s_validOnAnyDevice);
+                size_t newIdx = g_bookmarkManager->bookmarks.size() - 1;
+                g_bookmarkManager->bookmarks[newIdx].tags = tags;
+                g_bookmarkManager->bookmarks[newIdx].validOnAnyDevice = s_validOnAnyDevice;
+                g_bookmarkManager->bookmarks[newIdx].deviceId = newDeviceId;
+                g_bookmarkManager->save();
+                g_bookmarkManager->suppressSyncCallbacks = oldSuppress;
+                if (!g_bookmarkManager->suppressSyncCallbacks && g_bookmarkManager->onUpsert) {
+                    g_bookmarkManager->onUpsert(g_bookmarkManager->bookmarks[newIdx]);
+                }
+            } else {
+                g_bookmarkManager->add(newContent, newDeviceId, s_validOnAnyDevice);
+                size_t newIdx = g_bookmarkManager->bookmarks.size() - 1;
+                g_bookmarkManager->update(newIdx, newContent, hasExplicitType, explicitType, tags, newDeviceId, s_validOnAnyDevice);
+            }
         } else {
-            g_bookmarkManager->update(originalIdx, WideToUtf8(s_editResult), hasExplicitType, explicitType, tags, WideToUtf8(s_deviceIdResult), s_validOnAnyDevice);
+            g_bookmarkManager->update(originalIdx, newContent, hasExplicitType, explicitType, tags, newDeviceId, s_validOnAnyDevice);
         }
+
+        if (outSavedContentUtf8) *outSavedContentUtf8 = newContent;
         // Refresh list
         wchar_t buffer[256];
         GetWindowTextW(g_hEdit, buffer, 256);
         UpdateSearchList(WideToUtf8(buffer));
     }
+
+    return s_saved;
 }
 
 void UpdateSearchList(const std::string& query) {

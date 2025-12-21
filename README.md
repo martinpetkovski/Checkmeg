@@ -36,3 +36,10 @@ cmake --build . --config Release
 5. Type to filter bookmarks.
 6. Double-click an item to open it.
 7. Press `ESC` to close the search UI.
+
+## Supabase Auth (Optional)
+
+Checkmeg can optionally sign users in via Supabase Auth.
+
+- Copy [src/SupabaseConfig.example.h](src/SupabaseConfig.example.h) to `src/SupabaseConfig.h` and fill in your project URL + anon key.
+- Once signed in, the session is persisted and restored on next launch (stored under `%APPDATA%\Checkmeg\session.json`).
