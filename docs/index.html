@@ -4,14 +4,22 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Checkmeg Docs</title>
-  <link rel="icon" href="../checkmeg.ico" />
+  <link rel="icon" href="https://raw.githubusercontent.com/martinpetkovski/Checkmeg/main/checkmeg.ico" />
+  <link rel="icon" href="https://raw.githubusercontent.com/martinpetkovski/Checkmeg/master/checkmeg.ico" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <main class="container">
     <header class="topbar" aria-label="Checkmeg">
       <div class="brand">
-        <img class="brand-icon" src="../checkmeg.png" alt="Checkmeg" width="40" height="40" />
+        <img
+          class="brand-icon"
+          src="https://raw.githubusercontent.com/martinpetkovski/Checkmeg/main/checkmeg.png"
+          onerror="this.onerror=null;this.src='https://raw.githubusercontent.com/martinpetkovski/Checkmeg/master/checkmeg.png';"
+          alt="Checkmeg"
+          width="40"
+          height="40"
+        />
         <div class="brand-text">
           <div class="brand-title">Checkmeg</div>
           <div class="brand-subtitle">Save little things. Find them instantly.</div>
@@ -36,7 +44,10 @@
 
       const candidates = [
         'README.md',
-        '../README.md'
+        // GitHub Pages often publishes only the /docs folder, so ../README.md won't exist.
+        // Fallback to the repo README via raw.githubusercontent.com.
+        'https://raw.githubusercontent.com/martinpetkovski/Checkmeg/main/README.md',
+        'https://raw.githubusercontent.com/martinpetkovski/Checkmeg/master/README.md'
       ];
 
       const tryFetch = async (url) => {
