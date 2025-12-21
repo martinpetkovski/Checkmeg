@@ -1,0 +1,4 @@
+#include "resource.h"
+
+IDI_APPICON ICON "../checkmeg.ico"
+IDB_PNG_LOGO RCDATA "../checkmeg.png"

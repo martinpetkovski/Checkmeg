@@ -11,6 +11,7 @@
 #include <vector>
 #include <algorithm>
 #include "Bookmark.h"
+#include "resource.h"
 
 // Forward declaration (defined later in this file)
 extern BookmarkManager* g_bookmarkManager;
@@ -227,6 +228,7 @@ std::wstring Utf8ToWide(const std::string& str) {
 
 // Global variables
 BookmarkManager* g_bookmarkManager = nullptr;
+HINSTANCE g_hInstance = nullptr;
 HWND g_hSearchWnd = NULL;
 HWND g_hEdit = NULL;
 HWND g_hList = NULL;
@@ -284,6 +286,7 @@ WNDPROC g_OriginalListBoxProc;
 WNDPROC g_OriginalEditProc;
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    g_hInstance = hInstance;
     SetProcessDPIAware();
     g_hInst = hInstance;
 
@@ -428,14 +431,51 @@ static std::wstring GetExeDirW() {
     return exePath.substr(0, pos);
 }
 
+static Gdiplus::Image* LoadImageFromResource(HINSTANCE hInstance, INT resId, const WCHAR* resType) {
+    HRSRC hResource = FindResourceW(hInstance, MAKEINTRESOURCEW(resId), resType);
+    if (!hResource) return nullptr;
+
+    DWORD imageSize = SizeofResource(hInstance, hResource);
+    if (imageSize == 0) return nullptr;
+
+    HGLOBAL hGlobal = LoadResource(hInstance, hResource);
+    if (!hGlobal) return nullptr;
+
+    void* pResourceData = LockResource(hGlobal);
+    if (!pResourceData) return nullptr;
+
+    HGLOBAL hBuffer = GlobalAlloc(GMEM_MOVEABLE, imageSize);
+    if (!hBuffer) return nullptr;
+
+    void* pBuffer = GlobalLock(hBuffer);
+    if (!pBuffer) {
+        GlobalFree(hBuffer);
+        return nullptr;
+    }
+
+    CopyMemory(pBuffer, pResourceData, imageSize);
+    GlobalUnlock(hBuffer);
+
+    IStream* pStream = nullptr;
+    if (CreateStreamOnHGlobal(hBuffer, TRUE, &pStream) != S_OK) {
+        GlobalFree(hBuffer);
+        return nullptr;
+    }
+
+    Gdiplus::Image* pImage = Gdiplus::Image::FromStream(pStream);
+    pStream->Release();
+    
+    return pImage;
+}
+
 static void LoadLogoPngIfPresent() {
     if (!g_gdiplusToken) return;
     if (g_logoImage) {
         delete g_logoImage;
         g_logoImage = nullptr;
     }
-    std::wstring path = GetExeDirW() + L"\\checkmeg.png";
-    Gdiplus::Image* img = Gdiplus::Image::FromFile(path.c_str(), FALSE);
+    
+    Gdiplus::Image* img = LoadImageFromResource(g_hInstance, IDB_PNG_LOGO, RT_RCDATA);
     if (!img) return;
     if (img->GetLastStatus() != Gdiplus::Ok) {
         delete img;

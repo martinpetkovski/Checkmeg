@@ -2,6 +2,7 @@
 build/
 bin/
 lib/
+package/
 
 # Executables
 *.exe
@@ -12,6 +13,7 @@ lib/
 # Object files
 *.o
 *.obj
+*.res
 
 # Debug files
 *.pdb
