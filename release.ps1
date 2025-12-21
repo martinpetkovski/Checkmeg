@@ -1,24 +1,24 @@
-# Run the package script
-.\package.ps1
-
-# Find the generated zip file
+$ErrorActionPreference = 'Stop'
+& .\package.ps1
+if ($LASTEXITCODE -ne 0) {
+    throw "Packaging failed."
+}
 $packageDir = "package"
-$zipFile = Get-ChildItem -Path $packageDir -Filter "Checkmeg_*.zip" | Select-Object -First 1
+$zipFile = Get-ChildItem -Path $packageDir -Filter "Checkmeg_*.zip" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 
 if (-not $zipFile) {
     Write-Error "Could not find package zip file."
     exit 1
 }
-
-# Extract version from filename Checkmeg_1.25122101.zip
-# $zipFile.Name is Checkmeg_1.25122101.zip
-# We want 1.25122101
 $version = $zipFile.Name -replace "Checkmeg_", "" -replace ".zip", ""
 
 Write-Host "Creating release for version $version..."
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+    throw "GitHub CLI 'gh' is not installed or not on PATH. Install it from https://cli.github.com/ and run 'gh auth login'."
+}
 
-# Create GitHub release
-# gh release create <tag> <files> --title <title> --generate-notes
 gh release create "v$version" $zipFile.FullName --title "Checkmeg v$version" --generate-notes
 
 if ($LASTEXITCODE -eq 0) {

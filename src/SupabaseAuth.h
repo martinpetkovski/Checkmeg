@@ -8,7 +8,7 @@ struct SupabaseSession {
     std::string email;
     std::string accessToken;
     std::string refreshToken;
-    std::int64_t expiresAtUnix = 0; // seconds since epoch
+    std::int64_t expiresAtUnix = 0;
 };
 
 class SupabaseAuth {
@@ -17,18 +17,11 @@ public:
 
     const SupabaseSession& Session() const { return session_; }
     bool IsLoggedIn() const { return session_.loggedIn && !session_.refreshToken.empty(); }
-
-    // Loads any previously saved session from disk.
     bool LoadSessionFromDisk();
-
-    // Refreshes access token if we have a refresh token.
-    // Returns true if we end up logged in.
     bool TryRestoreOrRefresh(std::string* outError);
 
     bool SignInWithPassword(const std::string& email, const std::string& password, std::string* outError);
     bool SignUpWithPassword(const std::string& email, const std::string& password, std::string* outError);
-
-    // Best-effort server logout + clears local session.
     void Logout();
 
 private:

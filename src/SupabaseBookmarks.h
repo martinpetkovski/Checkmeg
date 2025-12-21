@@ -15,9 +15,6 @@
 #include <algorithm>
 
 #pragma comment(lib, "winhttp.lib")
-
-// Minimal PostgREST client for syncing bookmarks to Supabase.
-// Header-only to keep build scripts simple.
 class SupabaseBookmarks {
 public:
     explicit SupabaseBookmarks(SupabaseAuth* auth = nullptr) : auth_(auth) {}
@@ -33,17 +30,14 @@ public:
             return false;
         }
 
-        // Select all columns we use.
         std::string url = SupabaseConfig::EndpointBookmarksTable() +
             "?select=id,type,typeExplicit,content,binaryData,mimeType,tags,timestamp,lastUsed,deviceId,validOnAnyDevice";
         if (!includeBinary) {
-            // Avoid syncing/downloading binary bookmarks if the user disabled it.
             url += "&type=neq.Binary";
         }
 
         HttpResponse resp = HttpRequest("GET", url, "", BuildAuthHeaders());
         if (resp.status == 401 || resp.status == 403) {
-            // Try a one-time refresh/restore and retry.
             std::string ignored;
             auth_->TryRestoreOrRefresh(&ignored);
             resp = HttpRequest("GET", url, "", BuildAuthHeaders());
@@ -54,7 +48,6 @@ public:
             return false;
         }
 
-        // Response is a JSON array of objects.
         std::vector<std::string> objects = SplitTopLevelJsonObjects(resp.body);
         std::vector<Bookmark> result;
         result.reserve(objects.size());
@@ -82,7 +75,6 @@ public:
             result.push_back(std::move(b));
         }
 
-        // Sort by lastUsed desc (matches local behavior)
         std::sort(result.begin(), result.end(), [](const Bookmark& a, const Bookmark& b) {
             if (a.lastUsed == b.lastUsed) return a.timestamp > b.timestamp;
             return a.lastUsed > b.lastUsed;
@@ -102,10 +94,7 @@ public:
             return false;
         }
 
-        // Upsert by id.
         std::string url = SupabaseConfig::EndpointBookmarksTable() + "?on_conflict=id";
-
-        // PostgREST upsert works well with an array payload.
         std::string body = "[" + BuildBookmarkJsonObject(b) + "]";
 
         auto headers = BuildAuthHeaders();
@@ -321,7 +310,6 @@ private:
     }
 
     static std::string BestEffortExtractError(const std::string& json) {
-        // Handle PostgREST and Supabase error shapes.
         std::string m;
         if (JsonFindString(json, "message", &m) && !m.empty()) return m;
         if (JsonFindString(json, "msg", &m) && !m.empty()) return m;
@@ -451,8 +439,6 @@ private:
         pos++;
         while (pos < jsonObj.size() && (jsonObj[pos] == ' ' || jsonObj[pos] == '\t' || jsonObj[pos] == '\r' || jsonObj[pos] == '\n')) pos++;
         if (pos >= jsonObj.size() || jsonObj[pos] != '[') return out;
-
-        // Parse a JSON string array. (No nested arrays.)
         bool inStr = false;
         bool esc = false;
         std::string cur;
@@ -560,7 +546,6 @@ private:
             ss << "\"mimeType\":\"" << JsonEscape(b.mimeType) << "\",";
             ss << "\"binaryData\":\"" << JsonEscape(b.binaryData) << "\"";
         } else {
-            // Keep keys present (simpler schema expectations).
             ss << "\"mimeType\":\"\",";
             ss << "\"binaryData\":\"\"";
         }
@@ -580,7 +565,6 @@ private:
     }
 
     static std::string UrlEscapeComponent(const std::string& s) {
-        // Minimal URL component escape for id filter.
         static const char* hex = "0123456789ABCDEF";
         std::string out;
         out.reserve(s.size() + 8);

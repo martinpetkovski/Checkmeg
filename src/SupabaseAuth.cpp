@@ -86,12 +86,10 @@ static bool JsonFindString(const std::string& json, const std::string& key, std:
     if (pos == std::string::npos) return false;
     pos = json.find(':', pos + needle.size());
     if (pos == std::string::npos) return false;
-
-    // Skip whitespace
     pos++;
     while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\r' || json[pos] == '\n')) pos++;
     if (pos >= json.size() || json[pos] != '"') return false;
-    pos++; // after opening quote
+    pos++;
 
     std::string raw;
     for (; pos < json.size(); ++pos) {
@@ -204,11 +202,7 @@ static HttpResponse HttpPostJson(const std::string& url, const std::string& json
         return resp;
     }
 
-    // Timeouts (ms)
     WinHttpSetTimeouts(hRequest, 8000, 8000, 8000, 8000);
-
-    // Build headers
-    // NOTE: Supabase expects UTF-8 JSON. We send UTF-8 bytes in the request body.
     std::wstring allHeaders = L"Content-Type: application/json; charset=utf-8\r\n";
     for (const auto& kv : headers) {
         allHeaders += Utf8ToWide(kv.first + ": " + kv.second + "\r\n");
@@ -278,7 +272,7 @@ static std::int64_t NowUnix() {
     return (std::int64_t)std::time(nullptr);
 }
 
-} // namespace
+}
 
 SupabaseAuth::SupabaseAuth() = default;
 
@@ -316,7 +310,6 @@ bool SupabaseAuth::EnsureSessionDirExists() const {
     if (pos == std::wstring::npos) return false;
     std::wstring dir = filePath.substr(0, pos);
 
-    // CreateDirectory succeeds if exists.
     if (CreateDirectoryW(dir.c_str(), nullptr)) return true;
     DWORD err = GetLastError();
     return err == ERROR_ALREADY_EXISTS;
@@ -401,7 +394,6 @@ bool SupabaseAuth::RefreshWithToken(const std::string& refreshToken, std::string
         return false;
     }
 
-    // Supabase usually rotates refresh_token; handle both cases.
     if (!JsonFindString(resp.body, "refresh_token", &refreshNew) || refreshNew.empty()) {
         refreshNew = refreshToken;
     }
@@ -429,7 +421,6 @@ bool SupabaseAuth::TryRestoreOrRefresh(std::string* outError) {
         return true;
     }
 
-    // If refresh fails, clear local session.
     session_ = SupabaseSession{};
     ClearSessionOnDisk();
     if (outError) *outError = err;
@@ -473,7 +464,6 @@ bool SupabaseAuth::SignInWithPassword(const std::string& email, const std::strin
 
     std::string saveErr;
     if (!SaveSessionToDisk(&saveErr)) {
-        // Still consider login successful, but surface warning.
         if (outError) *outError = "Logged in, but failed to save session: " + saveErr;
     }
     return true;
@@ -494,7 +484,6 @@ bool SupabaseAuth::SignUpWithPassword(const std::string& email, const std::strin
         return false;
     }
 
-    // Some Supabase setups return session tokens immediately; others require email confirmation.
     std::string access;
     std::string refresh;
     std::int64_t expiresIn = 0;
@@ -512,7 +501,6 @@ bool SupabaseAuth::SignUpWithPassword(const std::string& email, const std::strin
         return true;
     }
 
-    // Signup succeeded but no session.
     session_ = SupabaseSession{};
     if (outError) *outError = "Sign up succeeded. If email confirmation is enabled, confirm your email then log in.";
     return true;

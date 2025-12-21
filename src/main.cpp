@@ -17,10 +17,8 @@
 #include "SupabaseBookmarks.h"
 #include "resource.h"
 
-// Forward declaration (defined later in this file)
 extern BookmarkManager* g_bookmarkManager;
 
-// Forward declarations for helpers
 std::string WideToUtf8(const std::wstring& wstr);
 std::wstring Utf8ToWide(const std::string& str);
 
@@ -124,17 +122,14 @@ static std::string GetCurrentDeviceId() {
 }
 
 static std::vector<std::string> ParseTags(const std::string& s) {
-    // Comma-separated tags. Also accepts whitespace around commas.
     std::vector<std::string> tags;
     std::string cur;
 
     auto push = [&](std::string v) {
         v = Trim(v);
         if (v.empty()) return;
-        // normalize leading '#'
         if (!v.empty() && v[0] == '#') v = Trim(v.substr(1));
         if (v.empty()) return;
-        // de-dupe (case-insensitive-ish for ASCII)
         std::string lower = v;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
         for (const auto& existing : tags) {
@@ -171,7 +166,6 @@ static std::wstring FormatLocalTime(std::time_t t) {
     std::tm tmLocal{};
     localtime_s(&tmLocal, &t);
     wchar_t buf[64] = {};
-    // yyyy-mm-dd hh:mm:ss
     wcsftime(buf, _countof(buf), L"%Y-%m-%d %H:%M:%S", &tmLocal);
     return buf;
 }
@@ -194,7 +188,7 @@ static int FindDuplicateIndex(const std::string& content, int excludeIndex = -1)
 }
 
 static LRESULT CALLBACK EditDialogChildSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
-    UINT_PTR /*uIdSubclass*/, DWORD_PTR /*dwRefData*/) {
+    UINT_PTR, DWORD_PTR) {
     if (msg == WM_KEYDOWN) {
         if (wParam == VK_TAB) {
             HWND parent = GetParent(hWnd);
@@ -222,7 +216,6 @@ static LRESULT CALLBACK EditDialogChildSubclassProc(HWND hWnd, UINT msg, WPARAM 
     return DefSubclassProc(hWnd, msg, wParam, lParam);
 }
 
-// Helper functions for Unicode conversion
 std::string WideToUtf8(const std::wstring& wstr) {
     if (wstr.empty()) return std::string();
     int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
@@ -239,7 +232,6 @@ std::wstring Utf8ToWide(const std::string& str) {
     return wstrTo;
 }
 
-// Global variables
 BookmarkManager* g_bookmarkManager = nullptr;
 HINSTANCE g_hInstance = nullptr;
 HWND g_hSearchWnd = NULL;
@@ -256,7 +248,6 @@ HFONT g_hEmojiFont = NULL;
 ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logoImage = nullptr;
 
-// Supabase auth (session persists to disk)
 SupabaseAuth g_supabaseAuth;
 SupabaseBookmarks g_supabaseBookmarks(&g_supabaseAuth);
 
@@ -268,7 +259,6 @@ static void RefreshSearchResultsAfterBookmarkReload();
 static std::string GetBookmarksJsonPathA();
 static void SyncLocalBookmarksToSupabase(HWND hWndForUi);
 
-// Constants
 #define HOTKEY_ID_OPEN 1
 #define HOTKEY_ID_CAPTURE 2
 #define IDC_SEARCH_EDIT 101
@@ -280,7 +270,6 @@ static void SyncLocalBookmarksToSupabase(HWND hWndForUi);
 #define ID_TRAY_OPTIONS 1002
 #define ID_TRAY_OPEN 1003
 
-// Forward declarations
 LRESULT CALLBACK MainWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK SearchWndProc(HWND, UINT, WPARAM, LPARAM);
 
@@ -324,7 +313,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
-    // GDI+ for loading/drawing PNG logo
     {
         Gdiplus::GdiplusStartupInput gdiplusStartupInput;
         Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
@@ -332,21 +320,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     
     LoadLogoPngIfPresent();
 
-    // Attempt to restore auth session early so we can decide the bookmark backend.
     TryAutoRestoreSupabaseSession();
     
-    // Initialize Bookmark Manager
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
     std::string exePath(path);
     std::string jsonPath = exePath.substr(0, exePath.find_last_of("\\/")) + "\\bookmarks.json";
 
-    // Do not autoload here; we decide local vs Supabase based on login state.
     g_bookmarkManager = new BookmarkManager(jsonPath, false);
     ConfigureBookmarkSyncHooks();
     ReloadBookmarksFromActiveBackend(NULL, false);
 
-    // Check for command line arguments (Context Menu Mode)
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argc > 1) {
@@ -363,7 +347,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
 
         if (!contentToBookmark.empty()) {
-            // Create a hidden window just to be the parent for the dialog
             WNDCLASSEXW wc = {0};
             wc.cbSize = sizeof(WNDCLASSEXW);
             wc.lpfnWndProc = DefWindowProc;
@@ -373,7 +356,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             g_hSearchWnd = CreateWindowExW(0, L"CheckmegTemp", L"", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
 
             if (binaryMode) {
-                // Read file content
                 std::ifstream file(contentToBookmark, std::ios::binary);
                 if (file) {
                     std::ostringstream ss;
@@ -383,7 +365,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     
                     std::string filename = contentToBookmark.substr(contentToBookmark.find_last_of("\\/") + 1);
 
-                    // Show edit dialog first; only add on Save.
                     Bookmark nb;
                     nb.type = BookmarkType::Binary;
                     nb.typeExplicit = true;
@@ -400,7 +381,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     MessageBoxW(NULL, L"Failed to open file for binary bookmarking.", L"Error", MB_OK);
                 }
             } else {
-                // Show edit dialog first; only add on Save.
                 Bookmark nb;
                 nb.type = BookmarkType::Text;
                 nb.typeExplicit = false;
@@ -421,7 +401,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     LocalFree(argv);
 
-    // Register Window Class for the main hidden window
     WNDCLASSEXW wc = {0};
     wc.cbSize = sizeof(WNDCLASSEXW);
     wc.lpfnWndProc = MainWndProc;
@@ -431,24 +410,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wc.hIconSm = GetAppIcon();
     RegisterClassExW(&wc);
 
-    // Create a hidden window to handle hotkeys
     HWND hWnd = CreateWindowExW(0, L"CheckmegMain", L"Checkmeg", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
 
-    // Init Tray Icon
     InitTrayIcon(hWnd);
 
-    // Register Hotkeys
-    // WIN + ALT + X to Open Search
     if (!RegisterHotKey(hWnd, HOTKEY_ID_OPEN, MOD_WIN | MOD_ALT, 'X')) {
         MessageBoxA(NULL, "Failed to register Open Hotkey (Win+Alt+X)!", "Error", MB_OK);
     }
     
-    // WIN + ALT + C to Capture
     if (!RegisterHotKey(hWnd, HOTKEY_ID_CAPTURE, MOD_WIN | MOD_ALT, 'C')) {
         MessageBoxA(NULL, "Failed to register Capture Hotkey (Win+Alt+C)!", "Error", MB_OK);
     }
 
-    // Main message loop
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
@@ -1206,17 +1179,15 @@ static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
       {
          *pClsid = pImageCodecInfo[j].Clsid;
          free(pImageCodecInfo);
-         return j;  // Success
+            return j;
       }    
    }
 
    free(pImageCodecInfo);
-   return -1;  // Failure
+    return -1;
 }
 
 void CaptureAndBookmark() {
-    // 1. Release modifiers (Win + Alt) so they don't interfere with Ctrl+C
-    // We simulate KeyUp for them.
     INPUT release[4] = {};
     int r = 0;
     
@@ -1244,8 +1215,6 @@ void CaptureAndBookmark() {
         Sleep(50);
     }
 
-    // 2. Clear Clipboard to ensure we get new data
-    // Retry opening clipboard as it might be locked by another app
     for (int i = 0; i < 5; ++i) {
         if (OpenClipboard(NULL)) {
             EmptyClipboard();
@@ -1255,7 +1224,6 @@ void CaptureAndBookmark() {
         Sleep(20);
     }
 
-    // 3. Send Ctrl+C
     INPUT inputs[4] = {};
     ZeroMemory(inputs, sizeof(inputs));
 
@@ -1275,15 +1243,13 @@ void CaptureAndBookmark() {
 
     SendInput(4, inputs, sizeof(INPUT));
 
-    // 4. Wait for clipboard to update with retries
     bool gotData = false;
     bool isText = false;
     bool isDib = false;
     bool isDrop = false;
 
-    for (int i = 0; i < 20; ++i) { // Wait up to 1 second
+    for (int i = 0; i < 20; ++i) {
         Sleep(50); 
-        // Check formats in priority order: File -> Image -> Text
         if (IsClipboardFormatAvailable(CF_HDROP)) {
             gotData = true;
             isDrop = true;
@@ -1302,11 +1268,9 @@ void CaptureAndBookmark() {
     }
 
     if (!gotData) {
-        // Optional: Beep or visual feedback that nothing was captured
         return;
     }
 
-    // 5. Get Data from Clipboard
     if (!OpenClipboard(NULL)) {
         MessageBoxW(NULL, L"Failed to open clipboard.", L"Error", MB_OK);
         return;
@@ -1320,10 +1284,8 @@ void CaptureAndBookmark() {
                 std::wstring wtext(pszText);
                 GlobalUnlock(hData);
                 
-                // 6. Save Bookmark
                 std::string text = WideToUtf8(wtext);
                 if (!text.empty()) {
-                    // Prevent duplicates
                     g_bookmarkManager->loadIfChanged(true);
                     int dup = FindDuplicateIndex(text);
                     if (dup >= 0) {
@@ -2756,9 +2718,7 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
     std::wstring deviceIdText = Utf8ToWide(b.deviceId);
     if (deviceIdText.empty()) deviceIdText = L"Unknown";
 
-    // Simple Input Dialog (using a MessageBox for now is not enough, we need a real dialog)
-    // Since we don't have resources, let's create a temporary modal window.
-    
+
     static std::wstring s_editResult;
     static int s_typeSelection;
     static std::wstring s_tagsResult;
@@ -2802,18 +2762,16 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
         switch(msg) {
             case WM_CREATE:
             {
-                // Type dropdown
                 hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
                     10, 10, 360, 250, hWnd, (HMENU)12, g_hInst, NULL);
 
-                // Emoji icons in dropdown
-                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F9EA  Auto");  // 🧪
-                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F4C4  Text");  // 📄
-                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F310  URL");   // 🌐
-                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F4C1  File");  // 📁
-                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F5A5  Command");  // 🖥️
-                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F4BE  Binary");  // 💾
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F9EA  Auto");
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F4C4  Text");
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F310  URL");
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F4C1  File");
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F5A5  Command");
+                SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"\U0001F4BE  Binary");
                 SendMessageW(hCombo, CB_SETCURSEL, (WPARAM)s_typeSelection, 0);
 
                 hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", ((LPCWSTR)((LPCREATESTRUCT)lParam)->lpCreateParams), 
@@ -2843,7 +2801,6 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                 hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 290, 240, 80, 30, hWnd, (HMENU)2, g_hInst, NULL);
 
                 if (g_hUiFont) {
-                    // Use emoji font for combo so emojis render, but keep Fira Code elsewhere.
                     SendMessageW(hCombo, WM_SETFONT, (WPARAM)(g_hEmojiFont ? g_hEmojiFont : g_hUiFont), TRUE);
                     SendMessageW(hEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                     SendMessageW(hTagsLabel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
@@ -2855,13 +2812,11 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                     SendMessageW(hCancel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                 }
 
-                // Enter saves, Esc cancels (from any input)
                 SetWindowSubclass(hEdit, EditDialogChildSubclassProc, 1, 0);
                 SetWindowSubclass(hTags, EditDialogChildSubclassProc, 2, 0);
                 SetWindowSubclass(hCombo, EditDialogChildSubclassProc, 3, 0);
                 SetWindowSubclass(hValidCheck, EditDialogChildSubclassProc, 4, 0);
 
-                // Force an initial layout pass.
                 RECT rc;
                 GetClientRect(hWnd, &rc);
                 SendMessageW(hWnd, WM_SIZE, 0, MAKELPARAM(rc.right - rc.left, rc.bottom - rc.top));
@@ -2910,7 +2865,7 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                 return 0;
             }
             case WM_COMMAND:
-                if (LOWORD(wParam) == 1) { // Save
+                if (LOWORD(wParam) == 1) {
                     int len = GetWindowTextLengthW(hEdit);
                     std::vector<wchar_t> buf(len + 1);
                     GetWindowTextW(hEdit, &buf[0], len + 1);
@@ -2922,12 +2877,8 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                     GetWindowTextW(hTags, &tbuf[0], tlen + 1);
                     std::wstring tagsW = &tbuf[0];
 
-                    // Duplicate check (do not close dialog if user declines)
                     if (g_bookmarkManager) {
                         g_bookmarkManager->loadIfChanged(true);
-                        // Only check duplicates if not binary (binary content is filename, which can be dup)
-                        // Or check if filename is dup?
-                        // For now, skip dup check for binary to avoid confusion
                         if (candidateTypeSel != 5) {
                             int exclude = (s_originalIdx == (size_t)-1) ? -1 : (int)s_originalIdx;
                             int dup = FindDuplicateIndex(WideToUtf8(candidateW), exclude);
@@ -2949,7 +2900,7 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
 
                     s_saved = true;
                     DestroyWindow(hWnd);
-                } else if (LOWORD(wParam) == 2) { // Cancel
+                } else if (LOWORD(wParam) == 2) {
                     DestroyWindow(hWnd);
                 }
                 break;

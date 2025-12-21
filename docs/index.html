@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Checkmeg Docs</title>
+  <link rel="icon" href="../checkmeg.ico" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="container">
+    <header class="topbar" aria-label="Checkmeg">
+      <div class="brand">
+        <img class="brand-icon" src="../checkmeg.png" alt="Checkmeg" width="40" height="40" />
+        <div class="brand-text">
+          <div class="brand-title">Checkmeg</div>
+          <div class="brand-subtitle">Save little things. Find them instantly.</div>
+        </div>
+      </div>
+      <a class="topbar-link" href="https://github.com/martinpetkovski/Checkmeg/releases/latest">Download</a>
+    </header>
+
+    <article id="content" class="markdown-body">Loading…</article>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script>
+    (function () {
+      const el = document.getElementById('content');
+      marked.setOptions({
+        gfm: true,
+        breaks: false,
+        mangle: false,
+        headerIds: false
+      });
+
+      const candidates = [
+        'README.md',
+        '../README.md'
+      ];
+
+      const tryFetch = async (url) => {
+        const r = await fetch(url, { cache: 'no-store' });
+        if (!r.ok) throw new Error(`Failed to load ${url} (${r.status})`);
+        return await r.text();
+      };
+
+      (async () => {
+        let lastErr = null;
+        for (const url of candidates) {
+          try {
+            const md = await tryFetch(url);
+            el.innerHTML = marked.parse(md);
+            return;
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+
+        const msg = String(lastErr && lastErr.message ? lastErr.message : lastErr);
+        if (location.protocol === 'file:') {
+          el.textContent = msg + "\n\nTip: open this via a local server (GitHub Pages or `python -m http.server` from the repo root) because browsers often block fetch() from file:// pages.";
+        } else {
+          el.textContent = msg;
+        }
+      })();
+    })();
+  </script>
+</body>
+</html>

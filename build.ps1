@@ -1,6 +1,4 @@
 Stop-Process -Name Checkmeg -Force -ErrorAction SilentlyContinue
-
-# Compile resources
 llvm-rc src/resource.rc /FO resource.res
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Resource compilation failed."

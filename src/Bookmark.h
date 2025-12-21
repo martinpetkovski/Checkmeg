@@ -20,14 +20,12 @@ enum class BookmarkType {
 };
 
 struct Bookmark {
-    // Stable identifier for syncing across devices/backends.
-    // Generated locally for legacy bookmarks that don't have one yet.
     std::string id;
     BookmarkType type;
     bool typeExplicit = false;
     std::string content;
-    std::string binaryData; // For Binary type
-    std::string mimeType; // For Binary type
+    std::string binaryData;
+    std::string mimeType;
     std::vector<std::string> tags;
     std::time_t timestamp;
     std::time_t lastUsed;
@@ -42,12 +40,8 @@ public:
     std::vector<Bookmark> bookmarks;
     std::string filePath;
 
-    // When false, the manager does NOT read or write the local JSON file.
-    // Intended for "logged in" mode where Supabase is the source of truth.
     bool useLocalFile = true;
 
-    // Optional hooks for syncing (e.g. to Supabase). These are no-ops unless set.
-    // `suppressSyncCallbacks` can be used during bulk loads/merges.
     bool suppressSyncCallbacks = false;
     std::function<void(const Bookmark&)> onUpsert;
     std::function<void(const Bookmark&)> onDelete;
@@ -75,7 +69,6 @@ public:
         std::error_code ec;
         auto wt = std::filesystem::last_write_time(filePath, ec);
         if (ec) {
-            // If we can't stat the file (missing, permissions), fall back to load.
             load(skipBinary);
             return;
         }
@@ -218,7 +211,6 @@ void updateLastUsed(size_t index) {
 
     void save() {
         if (!useLocalFile) return;
-        // Check if we need to load missing binary data
         bool needToLoad = false;
         for (const auto& b : bookmarks) {
             if (b.type == BookmarkType::Binary && !b.binaryDataLoaded) {
@@ -271,9 +263,6 @@ void updateLastUsed(size_t index) {
 
     void load(bool skipBinary = false) {
         if (!useLocalFile) return;
-        // For the "start simple" phase, we will implement a very basic parser 
-        // that assumes the exact format we write.
-        // In a real app, use nlohmann/json.
         bookmarks.clear();
         std::ifstream in(filePath);
         std::string line;
@@ -283,7 +272,6 @@ void updateLastUsed(size_t index) {
         size_t currentIndex = 0;
 
         while (smartGetLine(in, line, skipBinary)) {
-            // Trim whitespace
             line.erase(0, line.find_first_not_of(" \t"));
             current.lastUsed = 0;
                 
@@ -292,7 +280,6 @@ void updateLastUsed(size_t index) {
                 current = Bookmark();
                 current.id.clear();
                 current.tags.clear();
-                // Default values for new fields if missing in JSON
                 current.validOnAnyDevice = true; 
                 current.deviceId = "";
                 current.originalFileIndex = currentIndex;
@@ -312,7 +299,6 @@ void updateLastUsed(size_t index) {
                         insideTags = false;
                         continue;
                     }
-                    // Tag line like: "value",
                     std::string val = extractQuotedString(line);
                     if (!val.empty()) current.tags.push_back(unescape(val));
                     continue;
@@ -328,7 +314,6 @@ void updateLastUsed(size_t index) {
                     else if (val == "binary") current.type = BookmarkType::Binary;
                     else current.type = BookmarkType::Text;
                 } else if (line.find("\"typeExplicit\":") == 0) {
-                    // very simple bool parse
                     if (line.find("true") != std::string::npos) current.typeExplicit = true;
                     else current.typeExplicit = false;
                 } else if (line.find("\"mimeType\":") == 0) {
@@ -346,9 +331,7 @@ void updateLastUsed(size_t index) {
                     current.content = unescape(extractValue(line));
                 } else if (line.find("\"timestamp\":") == 0) {
                     std::string val = line.substr(line.find(":") + 1);
-                    // remove comma if present
                     if (val.find(",") != std::string::npos) val = val.substr(0, val.find(","));
-                    // trim
                     val.erase(0, val.find_first_not_of(" \t\r\n"));
                     val.erase(val.find_last_not_of(" \t\r\n") + 1);
                     current.timestamp = std::stoll(val);
@@ -367,9 +350,6 @@ void updateLastUsed(size_t index) {
             }
         }
 
-        // Backwards compatibility: if old files didn't have typeExplicit,
-        // default is false (auto type) which is already the struct default.
-
         std::error_code ec;
         lastWriteTime = std::filesystem::last_write_time(filePath, ec);
         hasLastWriteTime = !ec;
@@ -377,8 +357,6 @@ void updateLastUsed(size_t index) {
 
 private:
     std::string newUuid() {
-        // RFC 4122 version 4 UUID.
-        // Good enough for local stable IDs; no external deps.
         static thread_local std::mt19937_64 rng([] {
             std::random_device rd;
             std::seed_seq seq{ rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd() };
@@ -389,9 +367,8 @@ private:
         uint64_t a = dist(rng);
         uint64_t b = dist(rng);
 
-        // Set version (4) and variant (10xx)
-        b = (b & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL; // variant
-        a = (a & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL; // version
+        b = (b & 0x3FFFFFFFFFFFFFFFULL) | 0x8000000000000000ULL;
+        a = (a & 0xFFFFFFFFFFFF0FFFULL) | 0x0000000000004000ULL;
 
         auto hex = [](uint64_t v, int n) {
             static const char* k = "0123456789abcdef";
@@ -459,8 +436,6 @@ private:
         if (start == std::string::npos) return "";
         start++;
         size_t end = line.find("\"", start);
-        // Handle escaped quotes in value? Our simple parser might fail here if not careful.
-        // For now, assume simple structure.
         while (end != std::string::npos && line[end-1] == '\\') {
              end = line.find("\"", end + 1);
         }
@@ -468,8 +443,6 @@ private:
         return line.substr(start, end - start);
     }
 
-    // Extracts the first JSON string literal found in the line, without requiring a key/value colon.
-    // Intended for parsing array entries like: "tag", or "tag"
     std::string extractQuotedString(const std::string& line) {
         size_t start = line.find('"');
         if (start == std::string::npos) return "";
@@ -554,7 +527,6 @@ private:
             line.push_back(c);
 
             if (checkKey && line.length() <= 64) {
-                // Detect the key early and skip the (potentially huge) base64 payload.
                 if (line.find("\"binaryData\":") != std::string::npos) {
                     in.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
                     return true;
