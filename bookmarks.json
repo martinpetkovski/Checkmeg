@@ -1,0 +1,147 @@
+[
+  {
+    "type": "binary",
+    "typeExplicit": true,
+    "mimeType": "application/octet-stream",
+    "lastUsed": 0,
+    "tags": [
+    ],
+    "content": "my_robot_telemetry.mp4",
+    "timestamp": 1766280666,
+    "deviceId": "SERENITY",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "file",
+    "typeExplicit": false,
+    "lastUsed": 0,
+    "tags": [
+      "checkmeg",
+      "build"
+    ],
+    "content": "C:\\Projects\\Checkmeg\\build.ps1",
+    "timestamp": 1766276790,
+    "deviceId": "SERENITY",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "file",
+    "typeExplicit": false,
+    "lastUsed": 0,
+    "tags": [
+      "Checkmeg"
+    ],
+    "content": "C:\\Projects\\Checkmeg\\CMakeLists.txt",
+    "timestamp": 1766276000,
+    "deviceId": "SERENITY",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "url",
+    "typeExplicit": true,
+    "lastUsed": 0,
+    "tags": [
+      "GitHub"
+    ],
+    "content": "https://github.com",
+    "timestamp": 1766259729,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "file",
+    "typeExplicit": false,
+    "lastUsed": 1766312691,
+    "tags": [
+      "Projects"
+    ],
+    "content": "C:\\Projects",
+    "timestamp": 1766259331,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "url",
+    "typeExplicit": false,
+    "lastUsed": 0,
+    "tags": [
+      "Shakira",
+      "Whenever Wherever",
+      "Thas the deal"
+    ],
+    "content": "https://www.youtube.com/watch?v=weRHyjj34ZE",
+    "timestamp": 1766258831,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "url",
+    "typeExplicit": false,
+    "lastUsed": 0,
+    "tags": [
+      "insta",
+      "gr",
+      "nesh"
+    ],
+    "content": "https://www.instagram.com/",
+    "timestamp": 1766256849,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "url",
+    "typeExplicit": false,
+    "lastUsed": 0,
+    "tags": [
+      "Sioto Jazz"
+    ],
+    "content": "https://siotojazz.com/3000",
+    "timestamp": 1766256640,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "command",
+    "typeExplicit": true,
+    "lastUsed": 0,
+    "tags": [
+    ],
+    "content": "notepad",
+    "timestamp": 1766256467,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "text",
+    "typeExplicit": true,
+    "lastUsed": 0,
+    "tags": [
+    ],
+    "content": "41472",
+    "timestamp": 1766256460,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "text",
+    "typeExplicit": false,
+    "lastUsed": 0,
+    "tags": [
+    ],
+    "content": "PID 18232",
+    "timestamp": 1766255319,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  },
+  {
+    "type": "text",
+    "typeExplicit": false,
+    "lastUsed": 0,
+    "tags": [
+    ],
+    "content": "Checkmeg.exe",
+    "timestamp": 1766253609,
+    "deviceId": "",
+    "validOnAnyDevice": true
+  }
+]
