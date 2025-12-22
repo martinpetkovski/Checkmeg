@@ -5,6 +5,10 @@ namespace SupabaseConfig {
 inline const std::string SUPABASE_URL = "https://YOUR_PROJECT.supabase.co";
 inline const std::string SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
 
+// Used as additional entropy for encrypting/decrypting Sensitive bookmark content.
+// IMPORTANT: Changing this will make previously-encrypted Sensitive content undecryptable.
+inline const std::string SENSITIVE_CRYPTO_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_STRING";
+
 inline std::string AuthBaseUrl() {
     return SUPABASE_URL + "/auth/v1";
 }

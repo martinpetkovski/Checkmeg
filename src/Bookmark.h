@@ -11,6 +11,9 @@
 #include <random>
 #include <functional>
 
+#include "SensitiveCrypto.h"
+#include "SupabaseConfig.h"
+
 enum class BookmarkType {
     Text,
     URL,
@@ -24,6 +27,7 @@ struct Bookmark {
     BookmarkType type;
     bool typeExplicit = false;
     std::string content;
+    bool sensitive = false;
     std::string binaryData;
     std::string mimeType;
     std::vector<std::string> tags;
@@ -174,6 +178,28 @@ public:
         }
     }
 
+    void update(size_t index, const std::string& content, bool hasExplicitType, BookmarkType explicitType, const std::vector<std::string>& tags, const std::string& deviceId, bool validOnAnyDevice, bool sensitive) {
+        if (index < bookmarks.size()) {
+            bookmarks[index].content = content;
+            bookmarks[index].tags = tags;
+            if (hasExplicitType) {
+                bookmarks[index].typeExplicit = true;
+                bookmarks[index].type = explicitType;
+            } else {
+                bookmarks[index].typeExplicit = false;
+                bookmarks[index].type = detectType(content);
+            }
+            bookmarks[index].timestamp = std::time(nullptr);
+            bookmarks[index].deviceId = deviceId;
+            bookmarks[index].sensitive = sensitive;
+            // Sensitive is stored via DPAPI encryption; treat it as device/user scoped.
+            bookmarks[index].validOnAnyDevice = sensitive ? false : validOnAnyDevice;
+            save();
+
+            if (!suppressSyncCallbacks && onUpsert) onUpsert(bookmarks[index]);
+        }
+    }
+
     void updateBinaryData(size_t index, const std::string& data) {
         if (index < bookmarks.size()) {
             bookmarks[index].binaryData = data;
@@ -232,6 +258,7 @@ void updateLastUsed(size_t index) {
             out << "    \"id\": \"" << escape(b.id) << "\",\n";
             out << "    \"type\": \"" << typeToString(b.type) << "\",\n";
             out << "    \"typeExplicit\": " << (b.typeExplicit ? "true" : "false") << ",\n";
+            out << "    \"sensitive\": " << (b.sensitive ? "true" : "false") << ",\n";
             if (b.type == BookmarkType::Binary) {
                 out << "    \"mimeType\": \"" << escape(b.mimeType) << "\",\n";
                 std::string dataToWrite = b.binaryData;
@@ -248,7 +275,18 @@ void updateLastUsed(size_t index) {
                 out << "      \"" << escape(b.tags[t]) << "\"" << (t < b.tags.size() - 1 ? "," : "") << "\n";
             }
             out << "    ],\n";
-            out << "    \"content\": \"" << escape(b.content) << "\",\n";
+            if (b.sensitive) {
+                std::string cipherB64;
+                if (SensitiveCrypto::EncryptUtf8ToBase64Dpapi(b.content, SupabaseConfig::SENSITIVE_CRYPTO_KEY, &cipherB64)) {
+                    out << "    \"contentEnc\": \"" << escape(cipherB64) << "\",\n";
+                } else {
+                    // Worst case: avoid writing plaintext if encryption fails.
+                    out << "    \"contentEnc\": \"\",\n";
+                }
+                out << "    \"content\": \"\",\n";
+            } else {
+                out << "    \"content\": \"" << escape(b.content) << "\",\n";
+            }
             out << "    \"timestamp\": " << b.timestamp << ",\n";
             out << "    \"deviceId\": \"" << escape(b.deviceId) << "\",\n";
             out << "    \"validOnAnyDevice\": " << (b.validOnAnyDevice ? "true" : "false") << "\n";
@@ -271,6 +309,8 @@ void updateLastUsed(size_t index) {
         bool insideTags = false;
         size_t currentIndex = 0;
 
+        std::string pendingContentEnc;
+
         while (smartGetLine(in, line, skipBinary)) {
             line.erase(0, line.find_first_not_of(" \t"));
             current.lastUsed = 0;
@@ -284,10 +324,41 @@ void updateLastUsed(size_t index) {
                 current.deviceId = "";
                 current.originalFileIndex = currentIndex;
                 current.binaryDataLoaded = true;
+                current.sensitive = false;
+                pendingContentEnc.clear();
                 insideTags = false;
             } else if (line.find("}") == 0) {
                 if (inside) {
                     if (current.id.empty()) current.id = newUuid();
+
+                    if (current.sensitive) {
+                        // If we have an encrypted payload, decrypt it into current.content.
+                        std::string cipherB64;
+                        if (!pendingContentEnc.empty()) {
+                            cipherB64 = pendingContentEnc;
+                        } else {
+                            // Legacy inline marker support in case content was stored as enc:v1:<b64>
+                            (void)SensitiveCrypto::TryParseLegacyInlineMarker(current.content, &cipherB64);
+                        }
+
+                        if (!cipherB64.empty()) {
+                            std::string plain;
+                            if (SensitiveCrypto::DecryptUtf8FromBase64Dpapi(cipherB64, SupabaseConfig::SENSITIVE_CRYPTO_KEY, &plain)) {
+                                current.content = plain;
+                            } else {
+                                // Can't decrypt on this machine/user.
+                                current.content.clear();
+                                current.validOnAnyDevice = false;
+                            }
+                        } else {
+                            // Marked sensitive but no ciphertext; avoid retaining any accidental plaintext.
+                            current.content.clear();
+                        }
+
+                        // DPAPI is device/user scoped; don't treat as global.
+                        current.validOnAnyDevice = false;
+                    }
+
                     bookmarks.push_back(current);
                     inside = false;
                     insideTags = false;
@@ -325,8 +396,12 @@ void updateLastUsed(size_t index) {
                     } else {
                         current.binaryDataLoaded = false;
                     }
+                } else if (line.find("\"sensitive\":") == 0) {
+                    current.sensitive = (line.find("true") != std::string::npos);
                 } else if (line.find("\"tags\":") == 0) {
                     insideTags = true;
+                } else if (line.find("\"contentEnc\":") == 0) {
+                    pendingContentEnc = unescape(extractValue(line));
                 } else if (line.find("\"content\":") == 0) {
                     current.content = unescape(extractValue(line));
                 } else if (line.find("\"timestamp\":") == 0) {

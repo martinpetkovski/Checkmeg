@@ -1,4 +1,7 @@
 #define _WIN32_WINNT 0x0600
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -517,7 +520,7 @@ bool EditBookmarkAtIndex(size_t index, const Bookmark* pDuplicateSource = nullpt
 void DuplicateSelectedBookmark();
 void ExecuteSelectedBookmark();
 void WaitForTargetFocus();
-void PasteText(const std::string& text);
+void PasteText(const std::string& text, bool clearClipboardAfter = false);
 bool TryRunPowershell(const std::wstring& cmd);
 void TypeText(const std::string& text);
 void RestoreFocusToLastWindow();
@@ -2056,7 +2059,8 @@ LRESULT CALLBACK SearchWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
                     if (originalIdx >= 0 && originalIdx < (int)g_bookmarkManager->bookmarks.size()) {
                         const auto& b = g_bookmarkManager->bookmarks[originalIdx];
                         type = b.type;
-                        text = Utf8ToWide(b.content);
+                        const std::string rawContentUtf8 = b.content;
+                        text = b.sensitive ? L"***" : Utf8ToWide(b.content);
                         tags.reserve(b.tags.size());
                         for (const auto& t : b.tags) {
                             std::wstring wt = Utf8ToWide(t);
@@ -2095,7 +2099,10 @@ LRESULT CALLBACK SearchWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
 
                     bool drewFavicon = false;
                     if (type == BookmarkType::URL) {
-                        std::wstring host = ExtractUrlHostForFavicon(WideToUtf8(text));
+                        std::string hostSource = (originalIdx >= 0 && originalIdx < (int)g_bookmarkManager->bookmarks.size())
+                            ? g_bookmarkManager->bookmarks[originalIdx].content
+                            : WideToUtf8(text);
+                        std::wstring host = ExtractUrlHostForFavicon(hostSource);
                         if (!host.empty()) {
                             HICON hFav = NULL;
                             {
@@ -2467,7 +2474,7 @@ LRESULT CALLBACK ListBoxProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
                     int originalIdx = (int)SendMessage(g_hList, LB_GETITEMDATA, idx, 0);
                     std::wstring preview;
                     if (originalIdx >= 0 && originalIdx < (int)g_bookmarkManager->bookmarks.size()) {
-                        preview = Utf8ToWide(g_bookmarkManager->bookmarks[originalIdx].content);
+                            preview = g_bookmarkManager->bookmarks[originalIdx].sensitive ? L"***" : Utf8ToWide(g_bookmarkManager->bookmarks[originalIdx].content);
                     }
                     std::wstring msg = L"Delete this bookmark?";
                     if (!preview.empty()) {
@@ -2536,7 +2543,18 @@ LRESULT CALLBACK ListBoxProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
     return CallWindowProc(g_OriginalListBoxProc, hWnd, message, wParam, lParam);
 }
 
-void PasteText(const std::string& text) {
+static void ClearClipboardBestEffort() {
+    for (int i = 0; i < 5; ++i) {
+        if (OpenClipboard(NULL)) {
+            EmptyClipboard();
+            CloseClipboard();
+            return;
+        }
+        Sleep(20);
+    }
+}
+
+void PasteText(const std::string& text, bool clearClipboardAfter) {
     auto IsCheckmegWindow = [](HWND hWnd) -> bool {
         return (hWnd == NULL) || (hWnd == g_hSearchWnd) || (hWnd == g_hEdit) || (hWnd == g_hList) || (hWnd == g_hCreateButton);
     };
@@ -2612,6 +2630,10 @@ void PasteText(const std::string& text) {
     RestoreFocusToLast();
     ReleaseModifiers();
     TypeText(text);
+
+    if (clearClipboardAfter) {
+        ClearClipboardBestEffort();
+    }
 }
 
 bool TryRunPowershell(const std::wstring& cmd) {
@@ -2710,17 +2732,17 @@ void ExecuteSelectedBookmark() {
                 HINSTANCE hInst = ShellExecuteW(NULL, L"open", wContent.c_str(), NULL, NULL, SW_SHOWNORMAL);
                 if ((INT_PTR)hInst <= 32) {
                     WaitForTargetFocus();
-                    PasteText(b.content);
+                    PasteText(b.content, b.sensitive);
                 }
             } else if (b.type == BookmarkType::Command) {
                 if (!TryRunPowershell(wContent)) {
                     // If it fails, fall back to typing it as text.
                     WaitForTargetFocus();
-                    PasteText(b.content);
+                    PasteText(b.content, b.sensitive);
                 }
             } else {
                 WaitForTargetFocus();
-                PasteText(b.content);
+                PasteText(b.content, b.sensitive);
             }
         }
     }
@@ -3494,7 +3516,9 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
         b = g_bookmarkManager->bookmarks[originalIdx];
     }
 
-    std::wstring currentContent = Utf8ToWide(b.content);
+    // Never show sensitive content in plaintext.
+    std::string originalSensitiveContentUtf8 = b.sensitive ? b.content : std::string();
+    std::wstring currentContent = b.sensitive ? L"" : Utf8ToWide(b.content);
     std::string tagsText = FormatTags(b.tags);
     std::wstring timestampText = FormatLocalTime(b.timestamp);
     std::wstring deviceIdText = Utf8ToWide(b.deviceId);
@@ -3507,15 +3531,21 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
     static std::wstring s_timeResult;
     static std::wstring s_deviceIdResult;
     static bool s_validOnAnyDevice;
+    static bool s_sensitive;
     static bool s_saved;
     static size_t s_originalIdx;
+    static std::string s_originalSensitiveContentUtf8;
+    static bool s_sensitivePlaceholder;
     s_saved = false;
     s_editResult = currentContent;
     s_tagsResult = Utf8ToWide(tagsText);
     s_timeResult = timestampText;
     s_deviceIdResult = deviceIdText;
     s_validOnAnyDevice = b.validOnAnyDevice;
+    s_sensitive = b.sensitive;
     s_originalIdx = isNew ? (size_t)-1 : originalIdx;
+    s_originalSensitiveContentUtf8 = originalSensitiveContentUtf8;
+    s_sensitivePlaceholder = false;
 
     // 0=Auto, 1=Text, 2=URL, 3=File, 4=Command, 5=Binary
     if (!b.typeExplicit) {
@@ -3539,8 +3569,56 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
         static HWND hTimeLabel;
         static HWND hDeviceLabel;
         static HWND hValidCheck;
+        static HWND hSensitiveCheck;
         static HWND hSave;
         static HWND hCancel;
+        auto SwapEditToSensitiveMode = [&](bool enableSensitive) {
+            if (!hEdit || !IsWindow(hEdit)) return;
+
+            // Capture current visible text if transitioning from non-sensitive to sensitive.
+            if (enableSensitive) {
+                if (!s_sensitive) {
+                    int len = GetWindowTextLengthW(hEdit);
+                    if (len > 0) {
+                        std::vector<wchar_t> buf(len + 1);
+                        GetWindowTextW(hEdit, buf.data(), len + 1);
+                        s_originalSensitiveContentUtf8 = WideToUtf8(std::wstring(buf.data()));
+                    }
+                }
+            }
+
+            // Replace the edit control:
+            // - Sensitive: single-line password edit (never shows plaintext)
+            // - Non-sensitive: multiline edit
+            RECT rc;
+            GetWindowRect(hEdit, &rc);
+            MapWindowPoints(NULL, hWnd, (LPPOINT)&rc, 2);
+
+            DestroyWindow(hEdit);
+            hEdit = NULL;
+
+            if (enableSensitive) {
+                hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"***",
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_PASSWORD,
+                    rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+                    hWnd, (HMENU)10, g_hInst, NULL);
+                if (g_hUiFont) SendMessageW(hEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                SetWindowSubclass(hEdit, EditDialogChildSubclassProc, 1, 0);
+                SendMessageW(hEdit, EM_SETSEL, 0, -1);
+                s_sensitivePlaceholder = true;
+            } else {
+                std::wstring restore = Utf8ToWide(s_originalSensitiveContentUtf8);
+                hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", restore.c_str(),
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL,
+                    rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+                    hWnd, (HMENU)10, g_hInst, NULL);
+                if (g_hUiFont) SendMessageW(hEdit, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                SetWindowSubclass(hEdit, EditDialogChildSubclassProc, 1, 0);
+                s_sensitivePlaceholder = false;
+            }
+
+            SetFocus(hEdit);
+        };
         switch(msg) {
             case WM_CREATE:
             {
@@ -3579,6 +3657,13 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                     SendMessageW(hValidCheck, BM_SETCHECK, BST_CHECKED, 0);
                 }
 
+                hSensitiveCheck = CreateWindowExW(0, L"BUTTON", L"Sensitive", 
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                    10, 228, 360, 20, hWnd, (HMENU)14, g_hInst, NULL);
+                if (s_sensitive) {
+                    SendMessageW(hSensitiveCheck, BM_SETCHECK, BST_CHECKED, 0);
+                }
+
                 hSave = CreateWindowExW(0, L"BUTTON", L"Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 200, 240, 80, 30, hWnd, (HMENU)1, g_hInst, NULL);
                 hCancel = CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 290, 240, 80, 30, hWnd, (HMENU)2, g_hInst, NULL);
 
@@ -3590,6 +3675,7 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                     SendMessageW(hDeviceLabel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                     SendMessageW(hTimeLabel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                     SendMessageW(hValidCheck, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                    SendMessageW(hSensitiveCheck, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                     SendMessageW(hSave, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                     SendMessageW(hCancel, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                 }
@@ -3598,11 +3684,18 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                 SetWindowSubclass(hTags, EditDialogChildSubclassProc, 2, 0);
                 SetWindowSubclass(hCombo, EditDialogChildSubclassProc, 3, 0);
                 SetWindowSubclass(hValidCheck, EditDialogChildSubclassProc, 4, 0);
+                SetWindowSubclass(hSensitiveCheck, EditDialogChildSubclassProc, 5, 0);
 
                 RECT rc;
                 GetClientRect(hWnd, &rc);
                 SendMessageW(hWnd, WM_SIZE, 0, MAKELPARAM(rc.right - rc.left, rc.bottom - rc.top));
-                SetFocus(hEdit);
+
+                if (s_sensitive) {
+                    // Start in sensitive mode: never show plaintext.
+                    SwapEditToSensitiveMode(true);
+                } else {
+                    SetFocus(hEdit);
+                }
                 break;
             }
             case WM_SIZE:
@@ -3636,6 +3729,9 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                 SetWindowPos(hValidCheck, NULL, margin, y + 4, w, 20, SWP_NOZORDER);
                 y = y + 4 + 20;
 
+                SetWindowPos(hSensitiveCheck, NULL, margin, y + 4, w, 20, SWP_NOZORDER);
+                y = y + 4 + 20;
+
                 int btnW = 80;
                 int btnH = 30;
                 int gap = 10;
@@ -3647,12 +3743,72 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                 return 0;
             }
             case WM_COMMAND:
+                if (LOWORD(wParam) == 10 && HIWORD(wParam) == EN_CHANGE) {
+                    // If the sensitive field was showing the placeholder and the user started typing,
+                    // treat it as a real replacement value.
+                    if (s_sensitive && s_sensitivePlaceholder) {
+                        int len = GetWindowTextLengthW(hEdit);
+                        if (len != 3) {
+                            s_sensitivePlaceholder = false;
+                        } else {
+                            wchar_t buf3[8] = {};
+                            GetWindowTextW(hEdit, buf3, _countof(buf3));
+                            if (wcscmp(buf3, L"***") != 0) {
+                                s_sensitivePlaceholder = false;
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                if (LOWORD(wParam) == 14 && HIWORD(wParam) == BN_CLICKED) {
+                    bool nowSensitive = (SendMessageW(hSensitiveCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    if (nowSensitive) {
+                        // Disallow creating an empty sensitive bookmark (must have a secret).
+                        if (s_originalIdx == (size_t)-1) {
+                            int len = GetWindowTextLengthW(hEdit);
+                            if (len <= 0) {
+                                MessageBoxW(hWnd,
+                                    L"Sensitive bookmark content cannot be empty.",
+                                    L"Sensitive",
+                                    MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
+                                SendMessageW(hSensitiveCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+                                return 0;
+                            }
+                        }
+                        SwapEditToSensitiveMode(true);
+                        s_sensitive = true;
+                    } else {
+                        // Leaving sensitive mode: reveal the current value (since it's no longer sensitive).
+                        // If the password field is still the placeholder, restore the original secret.
+                        if (s_sensitive) {
+                            int len = GetWindowTextLengthW(hEdit);
+                            std::vector<wchar_t> buf(len + 1);
+                            GetWindowTextW(hEdit, buf.data(), len + 1);
+                            std::wstring curW = buf.data();
+                            if (!(s_sensitivePlaceholder && curW == L"***")) {
+                                s_originalSensitiveContentUtf8 = WideToUtf8(curW);
+                            }
+                        }
+                        SwapEditToSensitiveMode(false);
+                        s_sensitive = false;
+                    }
+                    break;
+                }
+
                 if (LOWORD(wParam) == 1) {
                     int len = GetWindowTextLengthW(hEdit);
                     std::vector<wchar_t> buf(len + 1);
                     GetWindowTextW(hEdit, &buf[0], len + 1);
                     std::wstring candidateW = &buf[0];
                     int candidateTypeSel = (int)SendMessageW(hCombo, CB_GETCURSEL, 0, 0);
+
+                    bool isSensitiveNow = (SendMessageW(hSensitiveCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    if (isSensitiveNow) {
+                        if (s_sensitivePlaceholder && candidateW == L"***" && !s_originalSensitiveContentUtf8.empty()) {
+                            candidateW = Utf8ToWide(s_originalSensitiveContentUtf8);
+                        }
+                    }
 
                     int tlen = GetWindowTextLengthW(hTags);
                     std::vector<wchar_t> tbuf(tlen + 1);
@@ -3679,6 +3835,22 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                     s_tagsResult = tagsW;
                     s_typeSelection = candidateTypeSel;
                     s_validOnAnyDevice = (SendMessageW(hValidCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    s_sensitive = (SendMessageW(hSensitiveCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+                    if (s_sensitive) {
+                        // DPAPI encrypted payload is device/user-scoped.
+                        s_validOnAnyDevice = false;
+
+                        // Don't allow creating an empty sensitive bookmark.
+                        if (s_originalIdx == (size_t)-1 && s_editResult.empty()) {
+                            MessageBoxW(hWnd,
+                                L"Sensitive bookmark content cannot be empty.",
+                                L"Sensitive",
+                                MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
+                            SetFocus(hEdit);
+                            return 0;
+                        }
+                    }
 
                     s_saved = true;
                     DestroyWindow(hWnd);
@@ -3753,6 +3925,14 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
         std::vector<std::string> tags = ParseTags(WideToUtf8(s_tagsResult));
         std::string newContent = WideToUtf8(s_editResult);
         std::string newDeviceId = WideToUtf8(s_deviceIdResult);
+        bool newSensitive = s_sensitive;
+
+        if (newSensitive) {
+            // Keep existing sensitive content if user didn't enter a replacement.
+            if (!isNew && newContent.empty() && !s_originalSensitiveContentUtf8.empty()) {
+                newContent = s_originalSensitiveContentUtf8;
+            }
+        }
 
         // Preserve original device ID when editing
         if (isNew) {
@@ -3766,6 +3946,7 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
                 g_bookmarkManager->bookmarks[newIdx].tags = tags;
                 g_bookmarkManager->bookmarks[newIdx].validOnAnyDevice = s_validOnAnyDevice;
                 g_bookmarkManager->bookmarks[newIdx].deviceId = newDeviceId;
+                g_bookmarkManager->bookmarks[newIdx].sensitive = newSensitive;
                 g_bookmarkManager->save();
                 g_bookmarkManager->suppressSyncCallbacks = oldSuppress;
                 if (!g_bookmarkManager->suppressSyncCallbacks && g_bookmarkManager->onUpsert) {
@@ -3774,10 +3955,10 @@ bool EditBookmarkAtIndex(size_t originalIdx, const Bookmark* pDuplicateSource, s
             } else {
                 g_bookmarkManager->add(newContent, newDeviceId, s_validOnAnyDevice);
                 size_t newIdx = g_bookmarkManager->bookmarks.size() - 1;
-                g_bookmarkManager->update(newIdx, newContent, hasExplicitType, explicitType, tags, newDeviceId, s_validOnAnyDevice);
+                g_bookmarkManager->update(newIdx, newContent, hasExplicitType, explicitType, tags, newDeviceId, s_validOnAnyDevice, newSensitive);
             }
         } else {
-            g_bookmarkManager->update(originalIdx, newContent, hasExplicitType, explicitType, tags, newDeviceId, s_validOnAnyDevice);
+            g_bookmarkManager->update(originalIdx, newContent, hasExplicitType, explicitType, tags, newDeviceId, s_validOnAnyDevice, newSensitive);
         }
 
         if (outSavedContentUtf8) *outSavedContentUtf8 = newContent;
@@ -3811,8 +3992,11 @@ void UpdateSearchList(const std::string& query) {
 
     for (size_t i = 0; i < g_bookmarkManager->bookmarks.size(); ++i) {
         const auto& b = g_bookmarkManager->bookmarks[i];
-        std::string lowerContent = b.content;
-        std::transform(lowerContent.begin(), lowerContent.end(), lowerContent.begin(), ::tolower);
+        std::string lowerContent;
+        if (!b.sensitive) {
+            lowerContent = b.content;
+            std::transform(lowerContent.begin(), lowerContent.end(), lowerContent.begin(), ::tolower);
+        }
 
         std::string lowerTags;
         for (const auto& t : b.tags) {
@@ -3822,9 +4006,9 @@ void UpdateSearchList(const std::string& query) {
             lowerTags += lt;
         }
 
-        if (query.empty() || lowerContent.find(lowerQuery) != std::string::npos || lowerTags.find(lowerQuery) != std::string::npos) {
+        if (query.empty() || (!lowerContent.empty() && lowerContent.find(lowerQuery) != std::string::npos) || lowerTags.find(lowerQuery) != std::string::npos) {
             // Owner-drawn listbox: store content as string, render emoji icon in WM_DRAWITEM.
-            std::wstring wDisplay = Utf8ToWide(b.content);
+            std::wstring wDisplay = b.sensitive ? L"***" : Utf8ToWide(b.content);
             int idx = (int)SendMessageW(g_hList, LB_ADDSTRING, 0, (LPARAM)wDisplay.c_str());
             SendMessage(g_hList, LB_SETITEMDATA, idx, (LPARAM)i);
         }

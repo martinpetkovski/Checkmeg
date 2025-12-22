@@ -6,6 +6,9 @@ create table if not exists public.bookmarks (
   type text not null check (type in ('text','url','file','command','binary')),
   "typeExplicit" boolean not null default false,
 
+  sensitive boolean not null default false,
+  "contentEnc" text not null default '',
+
   content text not null,
   "binaryData" text not null default '',
   "mimeType" text not null default '',

@@ -14,6 +14,9 @@
 #include <sstream>
 #include <algorithm>
 
+#include "SensitiveCrypto.h"
+#include "SupabaseConfig.h"
+
 #pragma comment(lib, "winhttp.lib")
 class SupabaseBookmarks {
 public:
@@ -30,8 +33,9 @@ public:
             return false;
         }
 
+        // Prefer explicit sensitive + contentEnc columns when present.
         std::string url = SupabaseConfig::EndpointBookmarksTable() +
-            "?select=id,type,typeExplicit,content,binaryData,mimeType,tags,timestamp,lastUsed,deviceId,validOnAnyDevice";
+            "?select=id,type,typeExplicit,content,contentEnc,sensitive,binaryData,mimeType,tags,timestamp,lastUsed,deviceId,validOnAnyDevice";
         if (!includeBinary) {
             // Schema uses lowercase: type in ('text','url','file','command','binary')
             url += "&type=neq.binary";
@@ -42,6 +46,25 @@ public:
             std::string ignored;
             auth_->TryRestoreOrRefresh(&ignored);
             resp = HttpRequest("GET", url, "", BuildAuthHeaders());
+        }
+
+        // Back-compat: if the project hasn't migrated the table yet (no contentEnc/sensitive columns), retry
+        // with the older select list.
+        if (resp.status >= 400 && resp.status < 500) {
+            if (resp.body.find("contentEnc") != std::string::npos || resp.body.find("sensitive") != std::string::npos) {
+                supportsSensitiveColumns_ = false;
+                std::string urlOld = SupabaseConfig::EndpointBookmarksTable() +
+                    "?select=id,type,typeExplicit,content,binaryData,mimeType,tags,timestamp,lastUsed,deviceId,validOnAnyDevice";
+                if (!includeBinary) {
+                    urlOld += "&type=neq.binary";
+                }
+                resp = HttpRequest("GET", urlOld, "", BuildAuthHeaders());
+                if (resp.status == 401 || resp.status == 403) {
+                    std::string ignored;
+                    auth_->TryRestoreOrRefresh(&ignored);
+                    resp = HttpRequest("GET", urlOld, "", BuildAuthHeaders());
+                }
+            }
         }
 
         if (resp.status < 200 || resp.status >= 300) {
@@ -61,14 +84,46 @@ public:
             std::string type = JsonGetString(obj, "type");
             b.type = ParseType(type);
             b.typeExplicit = JsonGetBool(obj, "typeExplicit", false);
-            b.content = JsonGetString(obj, "content");
+
+            const std::string rawContent = JsonGetString(obj, "content");
+            const std::string rawContentEnc = supportsSensitiveColumns_ ? JsonGetString(obj, "contentEnc") : std::string();
+            const bool rawSensitive = supportsSensitiveColumns_ ? JsonGetBool(obj, "sensitive", false) : false;
+
+            b.deviceId = JsonGetString(obj, "deviceId");
+            b.validOnAnyDevice = JsonGetBool(obj, "validOnAnyDevice", true);
+
+            b.sensitive = rawSensitive;
+
+            // Legacy inline marker support even without separate columns.
+            if (!b.sensitive && SensitiveCrypto::HasLegacyInlineMarker(rawContent)) {
+                b.sensitive = true;
+            }
+
+            if (b.sensitive) {
+                std::string cipherB64;
+                if (!rawContentEnc.empty()) {
+                    cipherB64 = rawContentEnc;
+                } else {
+                    (void)SensitiveCrypto::TryParseLegacyInlineMarker(rawContent, &cipherB64);
+                }
+
+                std::string plain;
+                if (!cipherB64.empty() && SensitiveCrypto::DecryptUtf8FromBase64Dpapi(cipherB64, SupabaseConfig::SENSITIVE_CRYPTO_KEY, &plain)) {
+                    b.content = plain;
+                    // DPAPI is user/device scoped.
+                    b.validOnAnyDevice = false;
+                } else {
+                    b.content.clear();
+                    b.validOnAnyDevice = false;
+                }
+            } else {
+                b.content = rawContent;
+            }
             b.binaryData = JsonGetString(obj, "binaryData");
             b.mimeType = JsonGetString(obj, "mimeType");
             b.tags = JsonGetStringArray(obj, "tags");
             b.timestamp = (std::time_t)JsonGetInt64(obj, "timestamp", 0);
             b.lastUsed = (std::time_t)JsonGetInt64(obj, "lastUsed", b.timestamp);
-            b.deviceId = JsonGetString(obj, "deviceId");
-            b.validOnAnyDevice = JsonGetBool(obj, "validOnAnyDevice", true);
 
             b.binaryDataLoaded = true;
             b.originalFileIndex = (size_t)-1;
@@ -96,7 +151,7 @@ public:
         }
 
         std::string url = SupabaseConfig::EndpointBookmarksTable() + "?on_conflict=id";
-        std::string body = "[" + BuildBookmarkJsonObject(b) + "]";
+        std::string body = "[" + BuildBookmarkJsonObject(b, supportsSensitiveColumns_) + "]";
 
         auto headers = BuildAuthHeaders();
         headers.push_back({"Prefer", "resolution=merge-duplicates,return=minimal"});
@@ -106,6 +161,20 @@ public:
             std::string ignored;
             auth_->TryRestoreOrRefresh(&ignored);
             resp = HttpRequest("POST", url, body, headers);
+        }
+
+        // Back-compat: if sensitive/contentEnc columns don't exist, retry without them.
+        if (resp.status >= 400 && resp.status < 500) {
+            if (resp.body.find("contentEnc") != std::string::npos || resp.body.find("sensitive") != std::string::npos) {
+                supportsSensitiveColumns_ = false;
+                body = "[" + BuildBookmarkJsonObject(b, false) + "]";
+                resp = HttpRequest("POST", url, body, headers);
+                if (resp.status == 401 || resp.status == 403) {
+                    std::string ignored;
+                    auth_->TryRestoreOrRefresh(&ignored);
+                    resp = HttpRequest("POST", url, body, headers);
+                }
+            }
         }
 
         if (resp.status < 200 || resp.status >= 300) {
@@ -148,6 +217,7 @@ private:
     };
 
     SupabaseAuth* auth_ = nullptr;
+    bool supportsSensitiveColumns_ = true;
 
     static std::wstring Utf8ToWide(const std::string& s) {
         if (s.empty()) return std::wstring();
@@ -520,7 +590,7 @@ private:
         return BookmarkType::Text;
     }
 
-    static std::string BuildBookmarkJsonObject(const Bookmark& b) {
+    static std::string BuildBookmarkJsonObject(const Bookmark& b, bool includeSensitiveColumns) {
         std::ostringstream ss;
         ss << "{";
         ss << "\"id\":\"" << JsonEscape(b.id) << "\",";
@@ -528,7 +598,24 @@ private:
         ss << "\"type\":\"" << JsonEscape(TypeToString(b.type)) << "\",";
         ss << "\"typeExplicit\":" << (b.typeExplicit ? "true" : "false") << ",";
 
-        ss << "\"content\":\"" << JsonEscape(b.content) << "\",";
+        if (includeSensitiveColumns) {
+            ss << "\"sensitive\":" << (b.sensitive ? "true" : "false") << ",";
+        }
+
+        if (b.sensitive) {
+            std::string cipherB64;
+            (void)SensitiveCrypto::EncryptUtf8ToBase64Dpapi(b.content, SupabaseConfig::SENSITIVE_CRYPTO_KEY, &cipherB64);
+
+            if (includeSensitiveColumns) {
+                ss << "\"contentEnc\":\"" << JsonEscape(cipherB64) << "\",";
+                ss << "\"content\":\"\",";
+            } else {
+                // Schema didn't migrate: store ciphertext inline in content.
+                ss << "\"content\":\"" << JsonEscape(SensitiveCrypto::MakeLegacyInlineMarker(cipherB64)) << "\",";
+            }
+        } else {
+            ss << "\"content\":\"" << JsonEscape(b.content) << "\",";
+        }
 
         ss << "\"tags\":[";
         for (size_t i = 0; i < b.tags.size(); ++i) {
