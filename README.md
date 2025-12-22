@@ -6,7 +6,7 @@ Think of it as a “personal clipboard with search”.
 
 > **Download:** [Latest release](https://github.com/martinpetkovski/Checkmeg/releases/latest)
 > 
-> **Hotkeys:** Capture `Win + Alt + C` • Search `Win + Alt + X`
+> **Hotkeys (defaults):** Capture `Win + Left Alt + X` • Search `Right Alt` (configurable in Options)
 
 **Quick links:**
 - [How to use it](#the-simple-version-how-youll-use-it)
@@ -23,10 +23,10 @@ Think of it as a “personal clipboard with search”.
 
 2) Save something you might want again
 	- Select something (a URL, text, a file path — anything you can copy).
-	- Press `Win + Alt + C` to save it into Checkmeg.
+	- Press `Win + Left Alt + X` to save it into Checkmeg.
 
 3) Find it later
-	- Press `Win + Alt + X` to open the search window.
+	- Press `Right Alt` to open the search window.
 	- Start typing to filter your saved items.
 
 4) Use it

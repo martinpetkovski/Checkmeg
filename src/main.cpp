@@ -7,11 +7,15 @@
 #include <objidl.h>
 #include <propidl.h>
 #include <gdiplus.h>
+#include <winhttp.h>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
+#include <mutex>
 #include <memory>
+#include <thread>
 #include "Bookmark.h"
 #include "SupabaseAuth.h"
 #include "SupabaseBookmarks.h"
@@ -244,14 +248,236 @@ bool g_isSearchVisible = false;
 HWND g_lastForegroundWnd = NULL;
 HFONT g_hUiFont = NULL;
 HFONT g_hEmojiFont = NULL;
+static HWND g_hMainWnd = NULL;
+static HWND g_hOptionsWnd = NULL;
+
+static constexpr UINT WM_APP_TOGGLE_SEARCH = WM_APP + 10;
+static constexpr UINT WM_APP_CAPTURE_BOOKMARK = WM_APP + 11;
+static constexpr UINT WM_APP_FAVICON_UPDATED = WM_APP + 12;
+
+static HHOOK g_hKeyboardHook = NULL;
+static bool g_searchSingleDown = false;
+static bool g_searchSingleUsedWithOther = false;
+static bool g_captureSingleDown = false;
+static bool g_captureSingleUsedWithOther = false;
+
+static std::mutex g_faviconMutex;
+static std::unordered_map<std::wstring, HICON> g_faviconByHost;
+static std::unordered_set<std::wstring> g_faviconInFlight;
+static std::unordered_set<std::wstring> g_faviconFailed;
+
+struct HotkeySpec {
+    bool singleKey = false;
+    DWORD vk = 0;
+    DWORD mods = 0; // 1=Win, 2=Ctrl, 4=Shift, 8=Alt
+    DWORD altSide = 0; // 0=any, 1=left, 2=right
+    DWORD winSide = 0; // 0=any, 1=left, 2=right
+};
+
+static constexpr DWORD HKMOD_WIN = 1;
+static constexpr DWORD HKMOD_CTRL = 2;
+static constexpr DWORD HKMOD_SHIFT = 4;
+static constexpr DWORD HKMOD_ALT = 8;
+
+static HotkeySpec g_hotkeySearch;
+static HotkeySpec g_hotkeyCapture;
+
+static bool g_hotkeyCaptureMode = false;
+
+static bool HotkeyEquals(const HotkeySpec& a, const HotkeySpec& b) {
+    return a.singleKey == b.singleKey && a.vk == b.vk && a.mods == b.mods && a.altSide == b.altSide && a.winSide == b.winSide;
+}
+
+static std::wstring VkToDisplayString(DWORD vk) {
+    if (vk >= 'A' && vk <= 'Z') {
+        wchar_t c = (wchar_t)vk;
+        return std::wstring(1, c);
+    }
+    if (vk >= '0' && vk <= '9') {
+        wchar_t c = (wchar_t)vk;
+        return std::wstring(1, c);
+    }
+    if (vk == VK_RMENU) return L"Right Alt";
+    if (vk == VK_LMENU) return L"Left Alt";
+    if (vk == VK_MENU) return L"Alt";
+    if (vk == VK_LWIN) return L"Left Win";
+    if (vk == VK_RWIN) return L"Right Win";
+    if (vk == VK_SHIFT) return L"Shift";
+    if (vk == VK_CONTROL) return L"Ctrl";
+    if (vk == VK_ESCAPE) return L"Esc";
+    if (vk == VK_SPACE) return L"Space";
+    if (vk == VK_TAB) return L"Tab";
+    if (vk == VK_RETURN) return L"Enter";
+
+    UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    if (scan) {
+        // Extended keys need the extended bit set in lParam.
+        LONG lparam = (LONG)(scan << 16);
+        wchar_t name[128] = {};
+        if (GetKeyNameTextW(lparam, name, _countof(name)) > 0) {
+            return name;
+        }
+    }
+    wchar_t buf[32] = {};
+    swprintf_s(buf, L"VK_%u", (unsigned)vk);
+    return buf;
+}
+
+static std::wstring HotkeyToDisplayString(const HotkeySpec& hk) {
+    if (hk.vk == 0) return L"(not set)";
+    if (hk.singleKey || hk.mods == 0) {
+        return VkToDisplayString(hk.vk);
+    }
+    std::wstring out;
+    auto append = [&](const wchar_t* s) {
+        if (!out.empty()) out += L" + ";
+        out += s;
+    };
+    if (hk.mods & HKMOD_WIN) {
+        if (hk.winSide == 1) append(L"Left Win");
+        else if (hk.winSide == 2) append(L"Right Win");
+        else append(L"Win");
+    }
+    if (hk.mods & HKMOD_CTRL) append(L"Ctrl");
+    if (hk.mods & HKMOD_SHIFT) append(L"Shift");
+    if (hk.mods & HKMOD_ALT) {
+        if (hk.altSide == 1) append(L"Left Alt");
+        else if (hk.altSide == 2) append(L"Right Alt");
+        else append(L"Alt");
+    }
+    append(VkToDisplayString(hk.vk).c_str());
+    return out;
+}
+
+static DWORD NormalizeModifierVkFromLparam(DWORD vk, LPARAM lParam) {
+    // In window messages, Alt/Ctrl may come through as VK_MENU/VK_CONTROL.
+    // Bit 24 in lParam indicates extended key (right-side for Alt/Ctrl).
+    bool extended = ((lParam >> 24) & 1) != 0;
+    if (vk == VK_MENU) return extended ? VK_RMENU : VK_LMENU;
+    if (vk == VK_CONTROL) return extended ? VK_RCONTROL : VK_LCONTROL;
+    return vk;
+}
+
+static DWORD NormalizeVkFromHook(const KBDLLHOOKSTRUCT* kb) {
+    if (!kb) return 0;
+    DWORD vk = kb->vkCode;
+    // WH_KEYBOARD_LL generally provides VK_L*/VK_R*, but be defensive.
+    if (vk == VK_MENU) return (kb->flags & LLKHF_EXTENDED) ? VK_RMENU : VK_LMENU;
+    if (vk == VK_CONTROL) return (kb->flags & LLKHF_EXTENDED) ? VK_RCONTROL : VK_LCONTROL;
+    return vk;
+}
+
+static void SetDefaultsIfUnset() {
+    // Defaults: Search = Right Alt, Capture = Win + Left Alt + X
+    if (g_hotkeySearch.vk == 0) {
+        g_hotkeySearch.singleKey = true;
+        g_hotkeySearch.vk = VK_RMENU;
+        g_hotkeySearch.mods = 0;
+        g_hotkeySearch.altSide = 2;
+        g_hotkeySearch.winSide = 0;
+    }
+    if (g_hotkeyCapture.vk == 0) {
+        g_hotkeyCapture.singleKey = false;
+        g_hotkeyCapture.vk = 'X';
+        g_hotkeyCapture.mods = HKMOD_WIN | HKMOD_ALT;
+        g_hotkeyCapture.altSide = 1;
+        g_hotkeyCapture.winSide = 0;
+    }
+}
+
+static HotkeySpec LoadHotkeyFromRegistry(const wchar_t* namePrefix, const HotkeySpec& def) {
+    HotkeySpec hk = def;
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Checkmeg", 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return hk;
+    }
+
+    auto readDword = [&](const std::wstring& name, DWORD* out) {
+        if (!out) return;
+        DWORD type = REG_DWORD;
+        DWORD size = sizeof(DWORD);
+        DWORD v = 0;
+        if (RegQueryValueExW(hKey, name.c_str(), NULL, &type, (LPBYTE)&v, &size) == ERROR_SUCCESS) {
+            *out = v;
+        }
+    };
+
+    DWORD type = hk.singleKey ? 0 : 1;
+    readDword(std::wstring(namePrefix) + L"Type", &type);
+    hk.singleKey = (type == 0);
+    readDword(std::wstring(namePrefix) + L"Vk", &hk.vk);
+    readDword(std::wstring(namePrefix) + L"Mods", &hk.mods);
+    readDword(std::wstring(namePrefix) + L"AltSide", &hk.altSide);
+    readDword(std::wstring(namePrefix) + L"WinSide", &hk.winSide);
+
+    // Migration: older versions may have stored VK_MENU for Right Alt.
+    if (hk.singleKey && hk.vk == VK_MENU) {
+        hk.vk = VK_RMENU;
+    }
+
+    RegCloseKey(hKey);
+    return hk;
+}
+
+static void SaveHotkeyToRegistry(const wchar_t* namePrefix, const HotkeySpec& hk) {
+    HKEY hKey = NULL;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Checkmeg", 0, NULL, 0, KEY_WRITE, NULL, &hKey, NULL) != ERROR_SUCCESS) {
+        return;
+    }
+    auto writeDword = [&](const std::wstring& name, DWORD value) {
+        RegSetValueExW(hKey, name.c_str(), 0, REG_DWORD, (const BYTE*)&value, sizeof(value));
+    };
+    writeDword(std::wstring(namePrefix) + L"Type", hk.singleKey ? 0 : 1);
+    writeDword(std::wstring(namePrefix) + L"Vk", hk.vk);
+    writeDword(std::wstring(namePrefix) + L"Mods", hk.mods);
+    writeDword(std::wstring(namePrefix) + L"AltSide", hk.altSide);
+    writeDword(std::wstring(namePrefix) + L"WinSide", hk.winSide);
+    RegCloseKey(hKey);
+}
+
+static void LoadHotkeySettings() {
+    HotkeySpec empty;
+    g_hotkeySearch = LoadHotkeyFromRegistry(L"HotkeySearch", empty);
+    g_hotkeyCapture = LoadHotkeyFromRegistry(L"HotkeyCapture", empty);
+    SetDefaultsIfUnset();
+}
+
+static bool IsOptionsForeground() {
+    if (!g_hOptionsWnd || !IsWindow(g_hOptionsWnd)) return false;
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    return fg == g_hOptionsWnd || IsChild(g_hOptionsWnd, fg);
+}
+
+static bool HotkeyModifiersMatch(const HotkeySpec& hk) {
+    if (hk.mods == 0) return true;
+    bool winDownL = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0;
+    bool winDownR = (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+    bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+    bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    bool altDownL = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0;
+    bool altDownR = (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
+
+    if (hk.mods & HKMOD_WIN) {
+        if (hk.winSide == 1) { if (!winDownL) return false; }
+        else if (hk.winSide == 2) { if (!winDownR) return false; }
+        else { if (!winDownL && !winDownR) return false; }
+    }
+    if (hk.mods & HKMOD_CTRL) { if (!ctrlDown) return false; }
+    if (hk.mods & HKMOD_SHIFT) { if (!shiftDown) return false; }
+    if (hk.mods & HKMOD_ALT) {
+        if (hk.altSide == 1) { if (!altDownL) return false; }
+        else if (hk.altSide == 2) { if (!altDownR) return false; }
+        else { if (!altDownL && !altDownR) return false; }
+    }
+    return true;
+}
 
 ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logoImage = nullptr;
 
 SupabaseAuth g_supabaseAuth;
 SupabaseBookmarks g_supabaseBookmarks(&g_supabaseAuth);
-
-static HWND g_hOptionsWnd = NULL;
 
 static void ConfigureBookmarkSyncHooks();
 static void ReloadBookmarksFromActiveBackend(HWND hWndForUi, bool showErrors);
@@ -302,6 +528,14 @@ void AddContextMenuRegistry();
 HICON GetAppIcon();
 static void LoadLogoPngIfPresent();
 
+static void CleanupFaviconCache();
+static std::wstring ExtractUrlHostForFavicon(const std::string& urlUtf8);
+static void EnsureFaviconFetchForHostAsync(const std::wstring& host);
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+static LRESULT CALLBACK OptionsHotkeyButtonSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR);
+static LRESULT CALLBACK OptionsTabPageSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR);
+
 WNDPROC g_OriginalListBoxProc;
 WNDPROC g_OriginalEditProc;
 
@@ -310,7 +544,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     SetProcessDPIAware();
     g_hInst = hInstance;
 
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES | ICC_TAB_CLASSES };
     InitCommonControlsEx(&icc);
 
     {
@@ -321,6 +555,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LoadLogoPngIfPresent();
 
     TryAutoRestoreSupabaseSession();
+
+    LoadHotkeySettings();
     
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -411,15 +647,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     RegisterClassExW(&wc);
 
     HWND hWnd = CreateWindowExW(0, L"CheckmegMain", L"Checkmeg", 0, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
+    g_hMainWnd = hWnd;
 
     InitTrayIcon(hWnd);
 
-    if (!RegisterHotKey(hWnd, HOTKEY_ID_OPEN, MOD_WIN | MOD_ALT, 'X')) {
-        MessageBoxA(NULL, "Failed to register Open Hotkey (Win+Alt+X)!", "Error", MB_OK);
-    }
-    
-    if (!RegisterHotKey(hWnd, HOTKEY_ID_CAPTURE, MOD_WIN | MOD_ALT, 'C')) {
-        MessageBoxA(NULL, "Failed to register Capture Hotkey (Win+Alt+C)!", "Error", MB_OK);
+    g_hKeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
+    if (!g_hKeyboardHook) {
+        MessageBoxW(NULL, L"Failed to install global keyboard hook.", L"Checkmeg", MB_OK | MB_ICONERROR);
     }
 
     MSG msg;
@@ -431,6 +665,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     RemoveTrayIcon(hWnd);
     delete g_bookmarkManager;
 
+    if (g_hKeyboardHook) {
+        UnhookWindowsHookEx(g_hKeyboardHook);
+        g_hKeyboardHook = NULL;
+    }
+
+    CleanupFaviconCache();
+
     if (g_logoImage) {
         delete g_logoImage;
         g_logoImage = nullptr;
@@ -440,6 +681,291 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_gdiplusToken = 0;
     }
     return (int) msg.wParam;
+}
+
+static void CleanupFaviconCache() {
+    std::lock_guard<std::mutex> lock(g_faviconMutex);
+    for (auto& kv : g_faviconByHost) {
+        if (kv.second) DestroyIcon(kv.second);
+    }
+    g_faviconByHost.clear();
+    g_faviconInFlight.clear();
+    g_faviconFailed.clear();
+}
+
+static bool CrackUrlAnyScheme(const std::wstring& url, std::wstring* outHost, INTERNET_PORT* outPort, std::wstring* outPath, bool* outSecure) {
+    if (!outHost || !outPort || !outPath || !outSecure) return false;
+
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    wchar_t host[256] = {};
+    wchar_t path[2048] = {};
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = _countof(host);
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = _countof(path);
+
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts)) return false;
+
+    if (parts.nScheme != INTERNET_SCHEME_HTTP && parts.nScheme != INTERNET_SCHEME_HTTPS) return false;
+    *outSecure = (parts.nScheme == INTERNET_SCHEME_HTTPS);
+    *outHost = std::wstring(parts.lpszHostName, parts.dwHostNameLength);
+    *outPort = parts.nPort;
+    std::wstring p = std::wstring(parts.lpszUrlPath, parts.dwUrlPathLength);
+    if (parts.dwExtraInfoLength && parts.lpszExtraInfo) {
+        p += std::wstring(parts.lpszExtraInfo, parts.dwExtraInfoLength);
+    }
+    if (p.empty()) p = L"/";
+    *outPath = p;
+    return true;
+}
+
+static std::wstring ExtractUrlHostForFavicon(const std::string& urlUtf8) {
+    std::wstring w = Utf8ToWide(urlUtf8);
+    if (w.empty()) return L"";
+
+    // BookmarkManager treats "www." as URL; normalize it to https for parsing.
+    if (w.rfind(L"www.", 0) == 0) {
+        w = L"https://" + w;
+    }
+
+    std::wstring host;
+    INTERNET_PORT port = 0;
+    std::wstring path;
+    bool secure = false;
+    if (!CrackUrlAnyScheme(w, &host, &port, &path, &secure)) return L"";
+    if (host.empty()) return L"";
+    return host;
+}
+
+static bool HttpGetBytes(const std::wstring& host, INTERNET_PORT port, bool secure, const std::wstring& path, std::vector<unsigned char>* outBytes) {
+    if (!outBytes) return false;
+    outBytes->clear();
+
+    HINTERNET hSession = WinHttpOpen(L"Checkmeg/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), port, 0);
+    if (!hConnect) {
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) {
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    WinHttpSetTimeouts(hRequest, 5000, 5000, 5000, 5000);
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+
+    BOOL ok = WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0);
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    ok = WinHttpReceiveResponse(hRequest, nullptr);
+    if (!ok) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
+        &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+    if (statusCode < 200 || statusCode >= 400) {
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    for (;;) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(hRequest, &available)) break;
+        if (available == 0) break;
+        size_t offset = outBytes->size();
+        outBytes->resize(offset + available);
+        DWORD read = 0;
+        if (!WinHttpReadData(hRequest, outBytes->data() + offset, available, &read)) break;
+        if (read == 0) break;
+        if (read < available) outBytes->resize(offset + read);
+        // Avoid absurdly large downloads for a favicon.
+        if (outBytes->size() > 256 * 1024) break;
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    return !outBytes->empty();
+}
+
+static HICON CreateHiconFromImageBytes(const std::vector<unsigned char>& bytes, int iconSize) {
+    if (!g_gdiplusToken) return NULL;
+    if (bytes.empty()) return NULL;
+
+    IStream* stream = NULL;
+    if (CreateStreamOnHGlobal(NULL, TRUE, &stream) != S_OK) return NULL;
+    ULONG written = 0;
+    stream->Write(bytes.data(), (ULONG)bytes.size(), &written);
+    LARGE_INTEGER zero{};
+    stream->Seek(zero, STREAM_SEEK_SET, NULL);
+
+    std::unique_ptr<Gdiplus::Image> img(Gdiplus::Image::FromStream(stream));
+    stream->Release();
+
+    if (!img || img->GetLastStatus() != Gdiplus::Ok) return NULL;
+
+    Gdiplus::Bitmap scaled(iconSize, iconSize, PixelFormat32bppARGB);
+    Gdiplus::Graphics g(&scaled);
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
+    g.DrawImage(img.get(), 0, 0, iconSize, iconSize);
+
+    HICON hIcon = NULL;
+    scaled.GetHICON(&hIcon);
+    return hIcon;
+}
+
+static void EnsureFaviconFetchForHostAsync(const std::wstring& host) {
+    if (host.empty()) return;
+
+    {
+        std::lock_guard<std::mutex> lock(g_faviconMutex);
+        if (g_faviconByHost.count(host)) return;
+        if (g_faviconFailed.count(host)) return;
+        if (g_faviconInFlight.count(host)) return;
+        g_faviconInFlight.insert(host);
+    }
+
+    std::thread([host]() {
+        std::vector<unsigned char> bytes;
+        bool ok = HttpGetBytes(host, INTERNET_DEFAULT_HTTPS_PORT, true, L"/favicon.ico", &bytes);
+        if (!ok) {
+            bytes.clear();
+            ok = HttpGetBytes(host, INTERNET_DEFAULT_HTTP_PORT, false, L"/favicon.ico", &bytes);
+        }
+
+        HICON icon = NULL;
+        if (ok) {
+            icon = CreateHiconFromImageBytes(bytes, 16);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_faviconMutex);
+            g_faviconInFlight.erase(host);
+            if (icon) {
+                g_faviconByHost[host] = icon;
+            } else {
+                g_faviconFailed.insert(host);
+            }
+        }
+
+        if (g_hSearchWnd && IsWindow(g_hSearchWnd)) {
+            PostMessageW(g_hSearchWnd, WM_APP_FAVICON_UPDATED, 0, 0);
+        }
+    }).detach();
+}
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION) {
+        const KBDLLHOOKSTRUCT* kb = (const KBDLLHOOKSTRUCT*)lParam;
+        if (kb) {
+            const DWORD vk = NormalizeVkFromHook(kb);
+            const bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+            const bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+            // Don't fire global hotkeys while the Options window is in front or while the user is rebinding.
+            if (IsOptionsForeground() || g_hotkeyCaptureMode) {
+                return CallNextHookEx(NULL, nCode, wParam, lParam);
+            }
+
+            auto handleSingle = [&](const HotkeySpec& spec, bool& downFlag, bool& usedFlag, UINT msgToPost) {
+                if (!spec.singleKey) return false;
+                if (spec.vk == 0) return false;
+                if (vk == spec.vk) {
+                    if (isDown) {
+                        downFlag = true;
+                        // Suppress AltGr (Ctrl+RightAlt) only for Right Alt single-key binding.
+                        if (spec.vk == VK_RMENU) {
+                            usedFlag = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                        } else {
+                            usedFlag = false;
+                        }
+                    } else if (isUp) {
+                        bool trigger = downFlag && !usedFlag;
+                        downFlag = false;
+                        usedFlag = false;
+                        if (trigger && g_hMainWnd && IsWindow(g_hMainWnd)) {
+                            PostMessageW(g_hMainWnd, msgToPost, 0, 0);
+                        }
+                    }
+                    return true;
+                }
+                if (downFlag && isDown) {
+                    usedFlag = true;
+                }
+                return false;
+            };
+
+            // First, handle possible single-key bindings.
+            (void)handleSingle(g_hotkeySearch, g_searchSingleDown, g_searchSingleUsedWithOther, WM_APP_TOGGLE_SEARCH);
+            (void)handleSingle(g_hotkeyCapture, g_captureSingleDown, g_captureSingleUsedWithOther, WM_APP_CAPTURE_BOOKMARK);
+
+            // Then, handle chord bindings.
+            auto handleChord = [&](const HotkeySpec& spec, UINT msgToPost) -> bool {
+                if (spec.singleKey) return false;
+                if (spec.vk == 0) return false;
+                if (!isDown) return false;
+                if (vk != spec.vk) return false;
+                if (!HotkeyModifiersMatch(spec)) return false;
+                if (g_hMainWnd && IsWindow(g_hMainWnd)) {
+                    PostMessageW(g_hMainWnd, msgToPost, 0, 0);
+                }
+                return true;
+            };
+
+            if (handleChord(g_hotkeyCapture, WM_APP_CAPTURE_BOOKMARK)) return 1;
+            if (handleChord(g_hotkeySearch, WM_APP_TOGGLE_SEARCH)) return 1;
+        }
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+static LRESULT CALLBACK OptionsHotkeyButtonSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYUP) {
+        HWND root = GetAncestor(hWnd, GA_ROOT);
+        if (root && IsWindow(root)) {
+            SendMessageW(root, msg, wParam, lParam);
+            return 0;
+        }
+    }
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK OptionsTabPageSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    // Buttons inside tab pages send WM_COMMAND to the page, not the main Options window.
+    // Forward those commands to the root so the existing handler works.
+    if (msg == WM_COMMAND) {
+        HWND root = GetAncestor(hWnd, GA_ROOT);
+        if (root && IsWindow(root)) {
+            SendMessageW(root, msg, wParam, lParam);
+            return 0;
+        }
+    }
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
 }
 
 static void ConfigureBookmarkSyncHooks() {
@@ -1037,6 +1563,12 @@ static bool ShowEmailPasswordDialog(const wchar_t* title, std::string* outEmail,
 
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_APP_TOGGLE_SEARCH:
+            ToggleSearchWindow();
+            break;
+        case WM_APP_CAPTURE_BOOKMARK:
+            CaptureAndBookmark();
+            break;
         case WM_HOTKEY:
             if (wParam == HOTKEY_ID_OPEN) {
                 ToggleSearchWindow();
@@ -1436,6 +1968,12 @@ void HideSearchWindowNoRestore() {
 
 LRESULT CALLBACK SearchWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_APP_FAVICON_UPDATED:
+            if (g_hList && IsWindow(g_hList)) {
+                InvalidateRect(g_hList, NULL, TRUE);
+                UpdateWindow(g_hList);
+            }
+            return 0;
         case WM_CTLCOLORSTATIC:
              // Make static controls transparent if needed, or set background color
              return (LRESULT)GetStockObject(WHITE_BRUSH);
@@ -1518,9 +2056,9 @@ LRESULT CALLBACK SearchWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
                         text = buf;
                     }
 
-                    // Icon (emoji) + text
+                    // Icon (favicon for URLs, emoji for everything else)
                     std::wstring icon;
-                    if (type == BookmarkType::URL) icon = L"\U0001F310";       // 🌐
+                    if (type == BookmarkType::URL) icon = L"\U0001F310";       // fallback 🌐 while favicon loads
                     else if (type == BookmarkType::File) icon = L"\U0001F4C1"; // 📁
                     else if (type == BookmarkType::Command) icon = L"\U0001F5A5"; // 🖥️
                     else if (type == BookmarkType::Binary) icon = L"\U0001F4BE"; // 💾
@@ -1538,10 +2076,36 @@ LRESULT CALLBACK SearchWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lP
                     RECT rc = dis->rcItem;
                     rc.left += padding;
 
-                    HFONT oldFont = (HFONT)SelectObject(dis->hDC, g_hEmojiFont ? g_hEmojiFont : g_hUiFont);
                     RECT rcIcon = rc;
                     rcIcon.right = rcIcon.left + 28;
-                    DrawTextW(dis->hDC, icon.c_str(), (int)icon.size(), &rcIcon, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                    bool drewFavicon = false;
+                    if (type == BookmarkType::URL) {
+                        std::wstring host = ExtractUrlHostForFavicon(WideToUtf8(text));
+                        if (!host.empty()) {
+                            HICON hFav = NULL;
+                            {
+                                std::lock_guard<std::mutex> lock(g_faviconMutex);
+                                auto it = g_faviconByHost.find(host);
+                                if (it != g_faviconByHost.end()) hFav = it->second;
+                            }
+
+                            if (hFav) {
+                                int iconSize = 16;
+                                int x = rcIcon.left + 2;
+                                int y = ((dis->rcItem.top + dis->rcItem.bottom) / 2) - (iconSize / 2);
+                                DrawIconEx(dis->hDC, x, y, hFav, iconSize, iconSize, 0, NULL, DI_NORMAL);
+                                drewFavicon = true;
+                            } else {
+                                EnsureFaviconFetchForHostAsync(host);
+                            }
+                        }
+                    }
+
+                    HFONT oldFont = (HFONT)SelectObject(dis->hDC, g_hEmojiFont ? g_hEmojiFont : g_hUiFont);
+                    if (!drewFavicon) {
+                        DrawTextW(dis->hDC, icon.c_str(), (int)icon.size(), &rcIcon, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                    }
 
                     SelectObject(dis->hDC, g_hUiFont ? g_hUiFont : oldFont);
                     RECT rcText = rc;
@@ -2250,6 +2814,11 @@ void ShowOptionsDialog() {
         static HFONT hTitleFont = NULL;
         static HFONT hVersionFont = NULL;
         static HFONT hSectionFont = NULL;
+        static HWND hTab = NULL;
+        static HWND hPageLogin = NULL;
+        static HWND hPageSystem = NULL;
+        static HWND hPageHotkeys = NULL;
+        static HWND hPageData = NULL;
         static HWND hBtnCtx = NULL;
         static HWND hBtnRun = NULL;
         static HWND hBtnOpenJson = NULL;
@@ -2260,8 +2829,42 @@ void ShowOptionsDialog() {
         static HWND hBtnLogin = NULL;
         static HWND hBtnSignup = NULL;
         static HWND hBtnLogout = NULL;
+        static HWND hBtnBindSearch = NULL;
+        static HWND hBtnBindCapture = NULL;
+        static int activeBind = 0; // 0 none, 1 search, 2 capture
+        static DWORD pendingModifierVk = 0;
+        static bool sawNonModifier = false;
         static bool isRegistered = false;
         static bool isRunAtStartup = false;
+
+        auto IsModifierVk = [](DWORD vk) -> bool {
+            return vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT ||
+                   vk == VK_CONTROL || vk == VK_LCONTROL || vk == VK_RCONTROL ||
+                   vk == VK_MENU || vk == VK_LMENU || vk == VK_RMENU ||
+                   vk == VK_LWIN || vk == VK_RWIN;
+        };
+
+        auto ShowOnlyPage = [&](HWND page) {
+            if (hPageLogin) ShowWindow(hPageLogin, (page == hPageLogin) ? SW_SHOW : SW_HIDE);
+            if (hPageSystem) ShowWindow(hPageSystem, (page == hPageSystem) ? SW_SHOW : SW_HIDE);
+            if (hPageHotkeys) ShowWindow(hPageHotkeys, (page == hPageHotkeys) ? SW_SHOW : SW_HIDE);
+            if (hPageData) ShowWindow(hPageData, (page == hPageData) ? SW_SHOW : SW_HIDE);
+        };
+
+        auto LayoutTabPages = [&](float scale) {
+            if (!hTab) return;
+            RECT rc;
+            GetClientRect(hTab, &rc);
+            TabCtrl_AdjustRect(hTab, FALSE, &rc);
+            int x = rc.left;
+            int y = rc.top;
+            int w = rc.right - rc.left;
+            int h = rc.bottom - rc.top;
+            if (hPageLogin) SetWindowPos(hPageLogin, NULL, x, y, w, h, SWP_NOZORDER);
+            if (hPageSystem) SetWindowPos(hPageSystem, NULL, x, y, w, h, SWP_NOZORDER);
+            if (hPageHotkeys) SetWindowPos(hPageHotkeys, NULL, x, y, w, h, SWP_NOZORDER);
+            if (hPageData) SetWindowPos(hPageData, NULL, x, y, w, h, SWP_NOZORDER);
+        };
 
         switch (msg) {
             case WM_CREATE: {
@@ -2281,13 +2884,49 @@ void ShowOptionsDialog() {
                 isRegistered = IsContextMenuRegistered();
                 isRunAtStartup = IsRunAtStartup();
 
-                // Login section buttons (top section)
+                // Ensure current hotkeys are loaded
+                LoadHotkeySettings();
+
+                // Tabs
+                hTab = CreateWindowExW(0, WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                    (int)(20 * scale), (int)(95 * scale), (int)(360 * scale), (int)(440 * scale), hWnd, (HMENU)100, g_hInst, NULL);
+                SendMessageW(hTab, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+
+                TCITEMW item{};
+                item.mask = TCIF_TEXT;
+                item.pszText = (LPWSTR)L"Login";
+                TabCtrl_InsertItem(hTab, 0, &item);
+                item.pszText = (LPWSTR)L"System";
+                TabCtrl_InsertItem(hTab, 1, &item);
+                item.pszText = (LPWSTR)L"Hotkeys";
+                TabCtrl_InsertItem(hTab, 2, &item);
+                item.pszText = (LPWSTR)L"Data";
+                TabCtrl_InsertItem(hTab, 3, &item);
+
+                hPageLogin = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                    0, 0, 0, 0, hTab, NULL, g_hInst, NULL);
+                hPageSystem = CreateWindowExW(0, L"STATIC", L"", WS_CHILD,
+                    0, 0, 0, 0, hTab, NULL, g_hInst, NULL);
+                hPageHotkeys = CreateWindowExW(0, L"STATIC", L"", WS_CHILD,
+                    0, 0, 0, 0, hTab, NULL, g_hInst, NULL);
+                hPageData = CreateWindowExW(0, L"STATIC", L"", WS_CHILD,
+                    0, 0, 0, 0, hTab, NULL, g_hInst, NULL);
+
+                SetWindowSubclass(hPageLogin, OptionsTabPageSubclassProc, 1, 0);
+                SetWindowSubclass(hPageSystem, OptionsTabPageSubclassProc, 1, 0);
+                SetWindowSubclass(hPageHotkeys, OptionsTabPageSubclassProc, 1, 0);
+                SetWindowSubclass(hPageData, OptionsTabPageSubclassProc, 1, 0);
+
+                LayoutTabPages(scale);
+                ShowOnlyPage(hPageLogin);
+
+                // Login tab
                 hBtnLogin = CreateWindowExW(0, L"BUTTON", L"Log in", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(130 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)10, g_hInst, NULL);
+                    (int)(20 * scale), (int)(25 * scale), (int)(300 * scale), (int)(30 * scale), hPageLogin, (HMENU)10, g_hInst, NULL);
                 hBtnSignup = CreateWindowExW(0, L"BUTTON", L"Sign up", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(165 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)11, g_hInst, NULL);
+                    (int)(20 * scale), (int)(60 * scale), (int)(300 * scale), (int)(30 * scale), hPageLogin, (HMENU)11, g_hInst, NULL);
                 hBtnLogout = CreateWindowExW(0, L"BUTTON", L"Log out", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(147 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)12, g_hInst, NULL);
+                    (int)(20 * scale), (int)(42 * scale), (int)(300 * scale), (int)(30 * scale), hPageLogin, (HMENU)12, g_hInst, NULL);
 
                 SendMessageW(hBtnLogin, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                 SendMessageW(hBtnSignup, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
@@ -2295,41 +2934,60 @@ void ShowOptionsDialog() {
 
                 RefreshOptionsLoginButtons(hBtnLogin, hBtnSignup, hBtnLogout);
 
-                // Run at Startup Checkbox (System Integration section)
+                // System tab
                 hBtnRun = CreateWindowExW(0, L"BUTTON", L"Run at Startup", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    (int)(40 * scale), (int)(250 * scale), (int)(300 * scale), (int)(25 * scale), hWnd, (HMENU)3, g_hInst, NULL);
+                    (int)(20 * scale), (int)(25 * scale), (int)(300 * scale), (int)(25 * scale), hPageSystem, (HMENU)3, g_hInst, NULL);
                 SendMessageW(hBtnRun, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                 SendMessageW(hBtnRun, BM_SETCHECK, isRunAtStartup ? BST_CHECKED : BST_UNCHECKED, 0);
 
                 // Context Menu Button
                 const wchar_t* btnText = isRegistered ? L"Remove from File Context Menu" : L"Add to File Context Menu";
                 hBtnCtx = CreateWindowExW(0, L"BUTTON", btnText, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(285 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)2, g_hInst, NULL);
+                    (int)(20 * scale), (int)(60 * scale), (int)(300 * scale), (int)(30 * scale), hPageSystem, (HMENU)2, g_hInst, NULL);
                 SendMessageW(hBtnCtx, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
-                // Export Bookmarks File Button (Data section)
+                // Hotkeys tab
+                CreateWindowExW(0, L"STATIC", L"Search", WS_CHILD | WS_VISIBLE,
+                    (int)(20 * scale), (int)(20 * scale), (int)(80 * scale), (int)(22 * scale), hPageHotkeys, NULL, g_hInst, NULL);
+
+                hBtnBindSearch = CreateWindowExW(0, L"BUTTON", HotkeyToDisplayString(g_hotkeySearch).c_str(),
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    (int)(20 * scale), (int)(70 * scale), (int)(300 * scale), (int)(30 * scale), hPageHotkeys, (HMENU)20, g_hInst, NULL);
+                SendMessageW(hBtnBindSearch, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                SetWindowSubclass(hBtnBindSearch, OptionsHotkeyButtonSubclassProc, 1, 0);
+
+                CreateWindowExW(0, L"STATIC", L"Bookmark", WS_CHILD | WS_VISIBLE,
+                    (int)(20 * scale), (int)(120 * scale), (int)(120 * scale), (int)(22 * scale), hPageHotkeys, NULL, g_hInst, NULL);
+
+                hBtnBindCapture = CreateWindowExW(0, L"BUTTON", HotkeyToDisplayString(g_hotkeyCapture).c_str(),
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    (int)(20 * scale), (int)(170 * scale), (int)(300 * scale), (int)(30 * scale), hPageHotkeys, (HMENU)21, g_hInst, NULL);
+                SendMessageW(hBtnBindCapture, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
+                SetWindowSubclass(hBtnBindCapture, OptionsHotkeyButtonSubclassProc, 1, 0);
+
+                // Data tab
                 hBtnRefreshSupabase = CreateWindowExW(0, L"BUTTON", L"Refresh from Supabase", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(370 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)7, g_hInst, NULL);
+                    (int)(20 * scale), (int)(25 * scale), (int)(300 * scale), (int)(30 * scale), hPageData, (HMENU)7, g_hInst, NULL);
                 SendMessageW(hBtnRefreshSupabase, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
                 hBtnOpenJson = CreateWindowExW(0, L"BUTTON", L"Export Bookmarks File", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(405 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)4, g_hInst, NULL);
+                    (int)(20 * scale), (int)(60 * scale), (int)(300 * scale), (int)(30 * scale), hPageData, (HMENU)4, g_hInst, NULL);
                 SendMessageW(hBtnOpenJson, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
                 // Sync local -> Supabase (local priority)
                 hBtnSyncLocal = CreateWindowExW(0, L"BUTTON", L"Sync local data to Supabase", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    (int)(40 * scale), (int)(440 * scale), (int)(300 * scale), (int)(30 * scale), hWnd, (HMENU)5, g_hInst, NULL);
+                    (int)(20 * scale), (int)(95 * scale), (int)(300 * scale), (int)(30 * scale), hPageData, (HMENU)5, g_hInst, NULL);
                 SendMessageW(hBtnSyncLocal, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
                 // Toggle Binary syncing
                 hChkBinarySync = CreateWindowExW(0, L"BUTTON", L"Sync binary bookmarks to Supabase",
                     WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                    (int)(40 * scale), (int)(475 * scale), (int)(320 * scale), (int)(25 * scale), hWnd, (HMENU)6, g_hInst, NULL);
+                    (int)(20 * scale), (int)(135 * scale), (int)(320 * scale), (int)(25 * scale), hPageData, (HMENU)6, g_hInst, NULL);
                 SendMessageW(hChkBinarySync, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
                 SendMessageW(hChkBinarySync, BM_SETCHECK, IsBinarySyncEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
 
                 hBtnOk = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-                    (int)(280 * scale), (int)(510 * scale), (int)(80 * scale), (int)(30 * scale), hWnd, (HMENU)1, g_hInst, NULL);
+                    (int)(300 * scale), (int)(545 * scale), (int)(80 * scale), (int)(30 * scale), hWnd, (HMENU)1, g_hInst, NULL);
                 SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
 
                 SetFocus(hBtnOk);
@@ -2360,53 +3018,154 @@ void ShowOptionsDialog() {
                 SetTextColor(hdc, RGB(100, 100, 100));
                 TextOutW(hdc, (int)(80 * scale), (int)(55 * scale), L"v1.0", 4);
 
-                // Separator
+                // Separator under header
                 HPEN hPen = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
                 HPEN oldPen = (HPEN)SelectObject(hdc, hPen);
-                MoveToEx(hdc, (int)(20 * scale), (int)(90 * scale), NULL);
-                LineTo(hdc, (int)(380 * scale), (int)(90 * scale));
+                MoveToEx(hdc, (int)(20 * scale), (int)(85 * scale), NULL);
+                LineTo(hdc, (int)(380 * scale), (int)(85 * scale));
                 SelectObject(hdc, oldPen);
                 DeleteObject(hPen);
-
-                // Login Header (top)
-                SelectObject(hdc, hSectionFont);
-                SetTextColor(hdc, RGB(0, 0, 0));
-                TextOutW(hdc, (int)(20 * scale), (int)(105 * scale), L"Login", 5);
-
-                // Separator 2
-                hPen = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
-                oldPen = (HPEN)SelectObject(hdc, hPen);
-                MoveToEx(hdc, (int)(20 * scale), (int)(215 * scale), NULL);
-                LineTo(hdc, (int)(380 * scale), (int)(215 * scale));
-                SelectObject(hdc, oldPen);
-                DeleteObject(hPen);
-
-                // System Integration Header
-                SelectObject(hdc, hSectionFont);
-                SetTextColor(hdc, RGB(0, 0, 0));
-                TextOutW(hdc, (int)(20 * scale), (int)(225 * scale), L"System Integration", 18);
-
-                // Separator 3
-                hPen = CreatePen(PS_SOLID, 1, RGB(220, 220, 220));
-                oldPen = (HPEN)SelectObject(hdc, hPen);
-                MoveToEx(hdc, (int)(20 * scale), (int)(330 * scale), NULL);
-                LineTo(hdc, (int)(380 * scale), (int)(330 * scale));
-                SelectObject(hdc, oldPen);
-                DeleteObject(hPen);
-
-                // Data Header
-                SelectObject(hdc, hSectionFont);
-                SetTextColor(hdc, RGB(0, 0, 0));
-                TextOutW(hdc, (int)(20 * scale), (int)(345 * scale), L"Data", 4);
 
                 SelectObject(hdc, oldFont);
                 EndPaint(hWnd, &ps);
                 return 0;
             }
+            case WM_NOTIFY: {
+                const NMHDR* nm = (const NMHDR*)lParam;
+                if (nm && nm->hwndFrom == hTab && nm->code == TCN_SELCHANGE) {
+                    int sel = TabCtrl_GetCurSel(hTab);
+                    if (sel == 0) ShowOnlyPage(hPageLogin);
+                    else if (sel == 1) ShowOnlyPage(hPageSystem);
+                    else if (sel == 2) ShowOnlyPage(hPageHotkeys);
+                    else if (sel == 3) ShowOnlyPage(hPageData);
+                    return 0;
+                }
+                break;
+            }
+            case WM_KEYDOWN:
+            case WM_SYSKEYDOWN: {
+                if (activeBind == 0) break;
+                DWORD vk = NormalizeModifierVkFromLparam((DWORD)wParam, lParam);
+                if (vk == VK_ESCAPE) {
+                    activeBind = 0;
+                    g_hotkeyCaptureMode = false;
+                    pendingModifierVk = 0;
+                    sawNonModifier = false;
+                    if (hBtnBindSearch) SetWindowTextW(hBtnBindSearch, HotkeyToDisplayString(g_hotkeySearch).c_str());
+                    if (hBtnBindCapture) SetWindowTextW(hBtnBindCapture, HotkeyToDisplayString(g_hotkeyCapture).c_str());
+                    return 0;
+                }
+
+                if (IsModifierVk(vk)) {
+                    pendingModifierVk = vk;
+                    return 0;
+                }
+                sawNonModifier = true;
+
+                HotkeySpec hk;
+                hk.vk = vk;
+                bool winL = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0;
+                bool winR = (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+                bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                bool altL = (GetAsyncKeyState(VK_LMENU) & 0x8000) != 0;
+                bool altR = (GetAsyncKeyState(VK_RMENU) & 0x8000) != 0;
+
+                if (winL || winR) {
+                    hk.mods |= HKMOD_WIN;
+                    if (winL && !winR) hk.winSide = 1;
+                    else if (winR && !winL) hk.winSide = 2;
+                }
+                if (ctrl) hk.mods |= HKMOD_CTRL;
+                if (shift) hk.mods |= HKMOD_SHIFT;
+                if (altL || altR) {
+                    hk.mods |= HKMOD_ALT;
+                    if (altL && !altR) hk.altSide = 1;
+                    else if (altR && !altL) hk.altSide = 2;
+                }
+
+                // Auto-detect: non-modifier key binds as a combo (mods may be 0)
+                hk.singleKey = false;
+
+                // Prevent the same hotkey for both actions.
+                if (activeBind == 1) {
+                    if (HotkeyEquals(hk, g_hotkeyCapture)) {
+                        MessageBoxW(hWnd, L"That hotkey is already used for Bookmark.\n\nChoose a different one.", L"Hotkeys", MB_OK | MB_ICONWARNING);
+                        return 0;
+                    }
+                    g_hotkeySearch = hk;
+                    SaveHotkeyToRegistry(L"HotkeySearch", g_hotkeySearch);
+                    if (hBtnBindSearch) SetWindowTextW(hBtnBindSearch, HotkeyToDisplayString(g_hotkeySearch).c_str());
+                } else if (activeBind == 2) {
+                    if (HotkeyEquals(hk, g_hotkeySearch)) {
+                        MessageBoxW(hWnd, L"That hotkey is already used for Search.\n\nChoose a different one.", L"Hotkeys", MB_OK | MB_ICONWARNING);
+                        return 0;
+                    }
+                    g_hotkeyCapture = hk;
+                    SaveHotkeyToRegistry(L"HotkeyCapture", g_hotkeyCapture);
+                    if (hBtnBindCapture) SetWindowTextW(hBtnBindCapture, HotkeyToDisplayString(g_hotkeyCapture).c_str());
+                }
+
+                activeBind = 0;
+                g_hotkeyCaptureMode = false;
+                pendingModifierVk = 0;
+                sawNonModifier = false;
+                return 0;
+            }
+            case WM_KEYUP:
+            case WM_SYSKEYUP: {
+                if (activeBind == 0) break;
+                DWORD vk = NormalizeModifierVkFromLparam((DWORD)wParam, lParam);
+                if (!sawNonModifier && pendingModifierVk != 0 && vk == pendingModifierVk) {
+                    // Modifier-only binding (press+release with no non-modifier key).
+                    HotkeySpec hk;
+                    hk.singleKey = true;
+                    hk.vk = vk;
+                    hk.mods = 0;
+                    hk.altSide = 0;
+                    hk.winSide = 0;
+
+                    if (activeBind == 1) {
+                        if (HotkeyEquals(hk, g_hotkeyCapture)) {
+                            MessageBoxW(hWnd, L"That hotkey is already used for Bookmark.\n\nChoose a different one.", L"Hotkeys", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
+                        g_hotkeySearch = hk;
+                        SaveHotkeyToRegistry(L"HotkeySearch", g_hotkeySearch);
+                        if (hBtnBindSearch) SetWindowTextW(hBtnBindSearch, HotkeyToDisplayString(g_hotkeySearch).c_str());
+                    } else if (activeBind == 2) {
+                        if (HotkeyEquals(hk, g_hotkeySearch)) {
+                            MessageBoxW(hWnd, L"That hotkey is already used for Search.\n\nChoose a different one.", L"Hotkeys", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
+                        g_hotkeyCapture = hk;
+                        SaveHotkeyToRegistry(L"HotkeyCapture", g_hotkeyCapture);
+                        if (hBtnBindCapture) SetWindowTextW(hBtnBindCapture, HotkeyToDisplayString(g_hotkeyCapture).c_str());
+                    }
+
+                    activeBind = 0;
+                    g_hotkeyCaptureMode = false;
+                    pendingModifierVk = 0;
+                    sawNonModifier = false;
+                    return 0;
+                }
+                break;
+            }
             case WM_COMMAND: {
                 int id = LOWORD(wParam);
                 if (id == 1) { // OK
                     DestroyWindow(hWnd);
+                } else if (id == 20 || id == 21) {
+                    // Start capturing a new hotkey
+                    activeBind = (id == 20) ? 1 : 2;
+                    g_hotkeyCaptureMode = true;
+                    pendingModifierVk = 0;
+                    sawNonModifier = false;
+                    if (id == 20 && hBtnBindSearch) SetWindowTextW(hBtnBindSearch, L"Press keys… (Esc to cancel)");
+                    if (id == 21 && hBtnBindCapture) SetWindowTextW(hBtnBindCapture, L"Press keys… (Esc to cancel)");
+                    // Keep focus on the button so keystrokes are forwarded via subclass.
+                    if (id == 20 && hBtnBindSearch) SetFocus(hBtnBindSearch);
+                    if (id == 21 && hBtnBindCapture) SetFocus(hBtnBindCapture);
                 } else if (id == 10) { // Log in
                     std::string email;
                     std::string password;
@@ -2521,6 +3280,7 @@ void ShowOptionsDialog() {
                 if (hTitleFont) DeleteObject(hTitleFont);
                 if (hVersionFont) DeleteObject(hVersionFont);
                 if (hSectionFont) DeleteObject(hSectionFont);
+                g_hotkeyCaptureMode = false;
                 g_hOptionsWnd = NULL;
                 return 0;
             case WM_CLOSE:
@@ -2539,7 +3299,7 @@ void ShowOptionsDialog() {
 
     // Size window by desired CLIENT size to avoid clipped bottom buttons.
     int clientW = (int)(400 * scale);
-    int clientH = (int)(580 * scale);
+    int clientH = (int)(590 * scale);
     RECT r{ 0, 0, clientW, clientH };
     DWORD style = WS_VISIBLE | WS_POPUP | WS_CAPTION | WS_SYSMENU;
     DWORD exStyle = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
