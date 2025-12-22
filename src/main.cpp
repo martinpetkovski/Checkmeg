@@ -535,6 +535,7 @@ static void EnsureFaviconFetchForHostAsync(const std::wstring& host);
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 static LRESULT CALLBACK OptionsHotkeyButtonSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR);
 static LRESULT CALLBACK OptionsTabPageSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR);
+static LRESULT CALLBACK SearchChildAltDSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR);
 
 WNDPROC g_OriginalListBoxProc;
 WNDPROC g_OriginalEditProc;
@@ -962,6 +963,19 @@ static LRESULT CALLBACK OptionsTabPageSubclassProc(HWND hWnd, UINT msg, WPARAM w
         HWND root = GetAncestor(hWnd, GA_ROOT);
         if (root && IsWindow(root)) {
             SendMessageW(root, msg, wParam, lParam);
+            return 0;
+        }
+    }
+    return DefSubclassProc(hWnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK SearchChildAltDSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_SYSKEYDOWN) {
+        if (wParam == 'D' || wParam == 'd') {
+            if (g_hEdit) {
+                SetFocus(g_hEdit);
+                SendMessageW(g_hEdit, EM_SETSEL, 0, -1);
+            }
             return 0;
         }
     }
@@ -2329,6 +2343,7 @@ void CreateSearchWindow() {
     );
     SendMessage(g_hCreateButton, WM_SETFONT, (WPARAM)g_hUiFont, TRUE);
     ShowWindow(g_hCreateButton, SW_HIDE);
+    SetWindowSubclass(g_hCreateButton, SearchChildAltDSubclassProc, 1, 0);
     
     // Subclass ListBox to handle Delete key and Context Menu
     g_OriginalListBoxProc = (WNDPROC)SetWindowLongPtr(g_hList, GWLP_WNDPROC, (LONG_PTR)ListBoxProc);
@@ -2418,6 +2433,13 @@ LRESULT CALLBACK EditProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 LRESULT CALLBACK ListBoxProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+        case WM_SYSKEYDOWN:
+            if (wParam == 'D' || wParam == 'd') {
+                SetFocus(g_hEdit);
+                SendMessageW(g_hEdit, EM_SETSEL, 0, -1);
+                return 0;
+            }
+            break;
         case WM_CHAR:
             if (wParam == VK_RETURN || wParam == VK_ESCAPE) return 0;
             // Forward typing to Edit

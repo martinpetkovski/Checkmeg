@@ -33,7 +33,8 @@ public:
         std::string url = SupabaseConfig::EndpointBookmarksTable() +
             "?select=id,type,typeExplicit,content,binaryData,mimeType,tags,timestamp,lastUsed,deviceId,validOnAnyDevice";
         if (!includeBinary) {
-            url += "&type=neq.Binary";
+            // Schema uses lowercase: type in ('text','url','file','command','binary')
+            url += "&type=neq.binary";
         }
 
         HttpResponse resp = HttpRequest("GET", url, "", BuildAuthHeaders());
