@@ -4,6 +4,10 @@ $version = "$major.$timestamp"
 $zipName = "Checkmeg_$version.zip"
 $packageDir = "package"
 
+# Update Version.h
+$versionHeader = "#pragma once`n#define CHECKMEG_VERSION `"$version`""
+Set-Content -Path "src/Version.h" -Value $versionHeader
+
 Write-Host "Building..."
 Stop-Process -Name Checkmeg -Force -ErrorAction SilentlyContinue
 llvm-rc src/resource.rc /FO resource.res

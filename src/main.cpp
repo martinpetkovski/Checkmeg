@@ -23,6 +23,7 @@
 #include "SupabaseAuth.h"
 #include "SupabaseBookmarks.h"
 #include "resource.h"
+#include "Updater.h"
 
 extern BookmarkManager* g_bookmarkManager;
 
@@ -498,6 +499,7 @@ static void SyncLocalBookmarksToSupabase(HWND hWndForUi);
 #define ID_TRAY_EXIT 1001
 #define ID_TRAY_OPTIONS 1002
 #define ID_TRAY_OPEN 1003
+#define ID_TRAY_CHECK_UPDATE 1004
 
 LRESULT CALLBACK MainWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK SearchWndProc(HWND, UINT, WPARAM, LPARAM);
@@ -543,6 +545,21 @@ static LRESULT CALLBACK SearchChildAltDSubclassProc(HWND hWnd, UINT msg, WPARAM 
 WNDPROC g_OriginalListBoxProc;
 WNDPROC g_OriginalEditProc;
 
+static void RunAutoUpdateCheck(bool silent) {
+    std::thread([silent]() {
+        Updater::UpdateInfo info = Updater::CheckForUpdates();
+        if (info.available) {
+            std::wstring msg = L"A new version of Checkmeg is available (" + Updater::Utf8ToWide(info.version) + L").\n\nDo you want to update now?";
+            int result = MessageBoxW(NULL, msg.c_str(), L"Update Available", MB_YESNO | MB_ICONQUESTION | MB_SYSTEMMODAL);
+            if (result == IDYES) {
+                Updater::TriggerUpdate(info.downloadUrl);
+            }
+        } else if (!silent) {
+            MessageBoxW(NULL, L"You are running the latest version.", L"Checkmeg", MB_OK | MB_ICONINFORMATION);
+        }
+    }).detach();
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     g_hInstance = hInstance;
     SetProcessDPIAware();
@@ -562,6 +579,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LoadHotkeySettings();
     
+    RunAutoUpdateCheck(true);
+
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
     std::string exePath(path);
@@ -1601,6 +1620,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
                 HMENU hMenu = CreatePopupMenu();
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPEN, L"Open Search");
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_OPTIONS, L"Options");
+                AppendMenuW(hMenu, MF_STRING, ID_TRAY_CHECK_UPDATE, L"Check for updates");
                 AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(hMenu, MF_STRING, ID_TRAY_EXIT, L"Quit");
                 int selection = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hWnd, NULL);
@@ -1609,6 +1629,8 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
                     PostQuitMessage(0);
                 } else if (selection == ID_TRAY_OPTIONS) {
                     ShowOptionsDialog();
+                } else if (selection == ID_TRAY_CHECK_UPDATE) {
+                    RunAutoUpdateCheck(false);
                 } else if (selection == ID_TRAY_OPEN) {
                     ToggleSearchWindow();
                 }
@@ -1969,9 +1991,24 @@ void ToggleSearchWindow() {
         // Clear search criteria when opening.
         SetWindowTextW(g_hEdit, L"");
         UpdateSearchList(""); // Show all initially and resize/center
-        ShowWindow(g_hSearchWnd, SW_SHOW);
-        SetForegroundWindow(g_hSearchWnd);
-        SetFocus(g_hEdit);
+        
+        // Improved focus stealing
+        HWND hFore = GetForegroundWindow();
+        DWORD dwForeID = GetWindowThreadProcessId(hFore, NULL);
+        DWORD dwCurID = GetCurrentThreadId();
+        
+        if (dwForeID != dwCurID) {
+            AttachThreadInput(dwForeID, dwCurID, TRUE);
+            ShowWindow(g_hSearchWnd, SW_SHOW);
+            SetForegroundWindow(g_hSearchWnd);
+            SetFocus(g_hEdit);
+            AttachThreadInput(dwForeID, dwCurID, FALSE);
+        } else {
+            ShowWindow(g_hSearchWnd, SW_SHOW);
+            SetForegroundWindow(g_hSearchWnd);
+            SetFocus(g_hEdit);
+        }
+
         g_isSearchVisible = true;
     }
 }

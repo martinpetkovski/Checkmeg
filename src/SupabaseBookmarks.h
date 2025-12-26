@@ -110,8 +110,12 @@ public:
                 std::string plain;
                 if (!cipherB64.empty() && SensitiveCrypto::DecryptUtf8FromBase64Dpapi(cipherB64, SupabaseConfig::SENSITIVE_CRYPTO_KEY, &plain)) {
                     b.content = plain;
-                    // DPAPI is user/device scoped.
-                    b.validOnAnyDevice = false;
+                    // If AES, it's portable. If DPAPI, it's device scoped.
+                    if (SensitiveCrypto::HasAesMarker(cipherB64)) {
+                        b.validOnAnyDevice = true;
+                    } else {
+                        b.validOnAnyDevice = false;
+                    }
                 } else {
                     b.content.clear();
                     b.validOnAnyDevice = false;
