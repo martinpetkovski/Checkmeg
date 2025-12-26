@@ -1842,7 +1842,16 @@ void CaptureAndBookmark() {
         return;
     }
 
-    if (!OpenClipboard(NULL)) {
+    bool clipboardOpened = false;
+    for (int i = 0; i < 10; ++i) {
+        if (OpenClipboard(NULL)) {
+            clipboardOpened = true;
+            break;
+        }
+        Sleep(50);
+    }
+
+    if (!clipboardOpened) {
         MessageBoxW(NULL, L"Failed to open clipboard.", L"Error", MB_OK);
         return;
     }
